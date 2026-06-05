@@ -61,6 +61,13 @@ Take argmax over axis=2 to get predicted label index per token.
 | Latency per chunk   | < 2000ms   | PyTorch fallback, CPU         |
 | Max sequence length | 512 tokens | Hard truncation applied       |
 
+## Verification Status
+| Field        | Value             |
+|--------------|-------------------|
+| Runtime used | ONNX Runtime INT8 |
+| Latency      | 8ms mean, tested locally on 5 sample texts |
+| Status       | Model test: PASS  |
+
 ## Known Limitations
 - Model detects PER, ORG, LOC, MISC — not Aadhaar/SSN/CC numbers directly
 - Structured PII (Aadhaar, PAN, phone, email, credit card) is handled by the

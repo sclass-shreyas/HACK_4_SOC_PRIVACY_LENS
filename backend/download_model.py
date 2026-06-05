@@ -12,6 +12,7 @@ MODEL_NAME = "elastic/distilbert-base-uncased-finetuned-conll03-english"
 PYTORCH_DIR = "assets/models/distilbert-ner"
 ONNX_PATH = "assets/models/distilbert-ner.onnx"
 INT8_PATH = "assets/models/distilbert-ner-int8.onnx"
+ROOT_ONNX_PATH = "../assets/models/distilbert-ner.onnx"
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -108,6 +109,8 @@ def main():
             weight_type=QuantType.QInt8,
         )
         shutil.move(INT8_PATH, ONNX_PATH)
+        os.makedirs(os.path.dirname(ROOT_ONNX_PATH), exist_ok=True)
+        shutil.copy2(ONNX_PATH, ROOT_ONNX_PATH)
         print("✓ INT8 quantization complete")
     except Exception as exc:
         print(f"✗ INT8 quantization failed: {exc}")

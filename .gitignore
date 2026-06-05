@@ -43,6 +43,7 @@ assets/test_data/sensitive/*
 
 # Generated ML model assets
 backend/assets/models/
+assets/models/
 
 # Build artifacts
 *.o

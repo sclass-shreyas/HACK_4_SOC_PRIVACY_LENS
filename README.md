@@ -20,6 +20,7 @@ See DEVELOPMENT.md for setup instructions.
 ## ML Model Assets
 
 PrivacyLens loads local model files from `backend/assets/models/` at demo time.
+`download_model.py` also mirrors the ONNX file to `assets/models/` for acceptance checks.
 Those generated binaries are not committed to git because they are large.
 
 From `backend/`, regenerate them with:

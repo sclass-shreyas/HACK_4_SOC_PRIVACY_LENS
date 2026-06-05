@@ -33,12 +33,16 @@ ID2LABEL = {
 
 def load_tokenizer():
     if os.path.isdir(PYTORCH_DIR):
-        return AutoTokenizer.from_pretrained(PYTORCH_DIR)
-    return AutoTokenizer.from_pretrained(HF_MODEL)
+        tokenizer = AutoTokenizer.from_pretrained(PYTORCH_DIR)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL)
+    print("Tokenizer loaded")
+    return tokenizer
 
 
 def load_backend():
     try:
+        print("Loading ONNX model")
         session = ort.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
         print("[ONNX] Active backend: assets/models/distilbert-ner.onnx")
         return "ONNX", session
@@ -173,8 +177,10 @@ def main():
 
         status = "✓ PASS" if elapsed_ms < TARGET_MS else "! SLOW"
         print(f"\nText: {text}")
+        print("Inference completed")
         print(f"Latency: {elapsed_ms:.0f}ms  {status}")
         if entities:
+            print("Detected entities:")
             for entity in entities:
                 print(f'  → [{entity["type"]}] "{entity["text"]}"  (conf: {entity["confidence"]:.2f})')
         else:
