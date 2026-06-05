@@ -1,76 +1,78 @@
-# MODEL_SCHEMA.md — PrivacyLens NER Model
+# MODEL_SCHEMA.md - PrivacyLens NER Model
+
+## Status Checklist
+| Task | Status |
+|---|---|
+| ONNX model loading | PASS - implemented in `test_onnx_inference.py` and `PIIClassifier._load_model()` |
+| Regex patterns (6 PII types) | PASS - Aadhaar, SSN, CreditCard, Email, Phone, PAN |
+| Basic Privacy Debt Score | PASS - implemented in `backend/app/scorer.py` |
+| INT8 quantization + speed validation | PASS - `download_model.py` exports and quantizes; `test_onnx_inference.py` validates latency |
+| Text chunking for 512 token limit | PASS - classifier chunks text before NER and uses `max_length=512` |
+| Async regex first / NER second | PASS - regex always runs first; NER runs only after model backend is loaded |
+| Labelmap + entity mapping | PASS - CoNLL labels map PER/ORG/LOC to Name/Organization/Location |
+| Confidence scoring per detection | PASS - regex uses 0.95; NER uses token softmax confidence |
+| Deduplication logic | PASS - duplicate detections are collapsed by type/value/span |
+| Score category breakdown | PASS - scorer returns identity/financial/contact/credentials/medical/location/bonus breakdown |
+| MODEL_SCHEMA.md updated | PASS - this file documents schema, fallback, and status |
 
 ## Model Identity
-| Field        | Value                                                    |
-|--------------|----------------------------------------------------------|
-| Base model   | elastic/distilbert-base-uncased-finetuned-conll03-english |
-| Source       | HuggingFace Hub (downloaded once, stored locally)        |
-| Task         | Token classification — Named Entity Recognition (NER)    |
-| Format       | ONNX Runtime (INT8 quantized)  +  PyTorch fallback       |
-| Quantization | Post-training dynamic INT8 via onnxruntime.quantization  |
-| ONNX opset   | 13                                                       |
+| Field | Value |
+|---|---|
+| Base model | `elastic/distilbert-base-uncased-finetuned-conll03-english` |
+| Task | Token classification / NER |
+| Primary runtime | ONNX Runtime INT8 |
+| Fallback runtime | PyTorch model, then regex-only |
+| ONNX path | `assets/models/distilbert-ner.onnx` |
+| Local tokenizer/model path | `assets/models/distilbert-ner/` |
 
-## Local File Paths
-| File                                  | Description                        |
-|---------------------------------------|------------------------------------|
-| assets/models/distilbert-ner/         | PyTorch weights + tokenizer files  |
-| assets/models/distilbert-ner.onnx     | INT8 quantized ONNX model (primary)|
+## Input Schema
+| Name | Shape | dtype | Notes |
+|---|---|---|---|
+| `input_ids` | `(batch, seq_len)` | `int64` | Token IDs |
+| `attention_mask` | `(batch, seq_len)` | `int64` | 1 for real tokens |
+| `token_type_ids` | `(batch, seq_len)` | `int64` | Included for ONNX compatibility |
 
-## ONNX Input Schema
-| Name             | Shape              | dtype  | Description             |
-|------------------|--------------------|--------|-------------------------|
-| input_ids        | (batch, seq_len)   | int64  | Tokenized input ids      |
-| attention_mask   | (batch, seq_len)   | int64  | 1 = real token, 0 = pad |
-| token_type_ids   | (batch, seq_len)   | int64  | Always 0 for single seq |
+Classifier chunks long text and sends at most 512 tokens per NER pass.
 
-- batch: dynamic (always 1 at inference time in PrivacyLens)
-- seq_len: dynamic, max 512 tokens
+## Output Schema
+| Name | Shape | dtype | Notes |
+|---|---|---|---|
+| `logits` | `(batch, seq_len, 9)` | `float32` | Softmax is applied for per-token confidence |
 
-## ONNX Output Schema
-| Name    | Shape                    | dtype   | Description                     |
-|---------|--------------------------|---------|---------------------------------|
-| logits  | (batch, seq_len, 9)      | float32 | Raw class scores per token      |
+## Label Map
+| ID | Label | PII Mapping |
+|---|---|---|
+| 0 | O | none |
+| 1 | B-PER | Name / identity |
+| 2 | I-PER | Name / identity |
+| 3 | B-ORG | Organization / contact |
+| 4 | I-ORG | Organization / contact |
+| 5 | B-LOC | Location |
+| 6 | I-LOC | Location |
+| 7 | B-MISC | ignored |
+| 8 | I-MISC | ignored |
 
-Apply softmax over axis=2 to get per-class probabilities.
-Take argmax over axis=2 to get predicted label index per token.
-
-## Label Map (CoNLL-03, 9 classes)
-| ID | Label  | Meaning                        | PII Relevance     |
-|----|--------|--------------------------------|-------------------|
-| 0  | O      | Outside any entity             | Not PII           |
-| 1  | B-PER  | Beginning of person name       | identity          |
-| 2  | I-PER  | Inside person name             | identity          |
-| 3  | B-ORG  | Beginning of organisation      | contact           |
-| 4  | I-ORG  | Inside organisation            | contact           |
-| 5  | B-LOC  | Beginning of location          | location          |
-| 6  | I-LOC  | Inside location                | location          |
-| 7  | B-MISC | Beginning of miscellaneous     | unknown           |
-| 8  | I-MISC | Inside miscellaneous           | unknown           |
-
-## Inference Backend Fallback Chain
-```
-1. ONNX (primary)   → assets/models/distilbert-ner.onnx
-2. PyTorch          → assets/models/distilbert-ner/
-3. Regex-only       → NER disabled, structured PII patterns still active
+## Validation Commands
+```powershell
+cd backend
+python -m app.classifier
+python -m app.scorer
+python test_onnx_inference.py
 ```
 
-## Performance Targets
-| Metric              | Target     | Condition                     |
-|---------------------|------------|-------------------------------|
-| Latency per chunk   | < 500ms    | INT8 ONNX, CPU, 512 tokens    |
-| Latency per chunk   | < 2000ms   | PyTorch fallback, CPU         |
-| Max sequence length | 512 tokens | Hard truncation applied       |
+Expected model status line:
 
-## Verification Status
-| Field        | Value             |
-|--------------|-------------------|
-| Runtime used | ONNX Runtime INT8 |
-| Latency      | 8ms mean, tested locally on 5 sample texts |
-| Status       | Model test: PASS  |
+```text
+Model test: PASS
+```
 
-## Known Limitations
-- Model detects PER, ORG, LOC, MISC — not Aadhaar/SSN/CC numbers directly
-- Structured PII (Aadhaar, PAN, phone, email, credit card) is handled by the
-  regex layer in classifier.py, not by this model
-- False positives possible on numeric strings in financial documents
-- Model was trained on English (CoNLL-03); Indian-language text will degrade accuracy
+If the ONNX artifact or Python ML dependencies are unavailable, the acceptable fallback status is:
+
+```text
+Model test: FALLBACK TO PYTORCH - export steps documented
+```
+
+## Notes
+- Regex detects structured PII: Aadhaar, SSN, CreditCard, Email, Phone, PAN, BankAccount, RoutingCode, Secret/APIKey, and Medical keywords.
+- NER detects names, organizations, and locations only; it does not detect Aadhaar/SSN/credit-card numbers by itself.
+- `download_model.py` is responsible for downloading, exporting ONNX, and INT8 quantization.
