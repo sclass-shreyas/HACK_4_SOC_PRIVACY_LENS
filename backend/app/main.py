@@ -1,21 +1,26 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
+from pydantic import BaseModel, Field
+from typing import Any, List
 import logging
 import os
 
 from app.crawler import FileCrawler
+from app.ledger import EncryptedLedger, InvalidLedgerKeyError, LedgerQueryError
 from app.remediation import secure_delete, encrypt_file, redact_file
 
 
 class ShredRequest(BaseModel):
     filepath: str
+    ledger_db_path: str | None = None
+    ledger_passphrase: str | None = None
 
 
 class EncryptRequest(BaseModel):
     filepath: str
     password: str
+    ledger_db_path: str | None = None
+    ledger_passphrase: str | None = None
 
 
 class PiiItem(BaseModel):
@@ -26,6 +31,49 @@ class PiiItem(BaseModel):
 class RedactRequest(BaseModel):
     filepath: str
     pii_list: List[PiiItem]
+    ledger_db_path: str | None = None
+    ledger_passphrase: str | None = None
+
+
+class LedgerInitRequest(BaseModel):
+    db_path: str
+    passphrase: str
+    kdf_iterations: int = 100_000
+
+
+class LedgerInsertRequest(BaseModel):
+    db_path: str
+    passphrase: str
+    type: str
+    source: str
+    payload: dict[str, Any]
+    metadata: dict[str, Any] | None = None
+
+
+class LedgerQueryRequest(BaseModel):
+    db_path: str
+    passphrase: str
+    sql: str
+    params: list[Any] = Field(default_factory=list)
+    limit: int = 100
+    offset: int = 0
+
+
+class LedgerBackupRequest(BaseModel):
+    db_path: str
+    passphrase: str
+    out_path: str
+
+
+class LedgerRotateKeyRequest(BaseModel):
+    db_path: str
+    old_passphrase: str
+    new_passphrase: str
+    new_kdf_iterations: int | None = None
+
+
+class LedgerCloseRequest(BaseModel):
+    db_path: str | None = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,6 +82,16 @@ logger = logging.getLogger(__name__)
 
 class ScanRequest(BaseModel):
     directory: str
+
+
+def _ledger_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, InvalidLedgerKeyError):
+        return HTTPException(status_code=403, detail="invalid_db_key")
+    if isinstance(exc, LedgerQueryError):
+        return HTTPException(status_code=400, detail="invalid_query")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail="ledger_error")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -95,7 +153,11 @@ async def calculate_privacy_score(files_data: dict):
 async def shred_file(request: ShredRequest):
     """Securely overwrite and delete a file."""
     try:
-        result = secure_delete(request.filepath)
+        result = secure_delete(
+            request.filepath,
+            ledger_db_path=request.ledger_db_path,
+            ledger_passphrase=request.ledger_passphrase,
+        )
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -107,7 +169,12 @@ async def shred_file(request: ShredRequest):
 async def encrypt_file_endpoint(request: EncryptRequest):
     """AES-encrypt a file and shred the original."""
     try:
-        result = encrypt_file(request.filepath, request.password)
+        result = encrypt_file(
+            request.filepath,
+            request.password,
+            ledger_db_path=request.ledger_db_path,
+            ledger_passphrase=request.ledger_passphrase,
+        )
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -121,7 +188,9 @@ async def redact_file_endpoint(request: RedactRequest):
     try:
         result = redact_file(
             request.filepath,
-            [item.model_dump() for item in request.pii_list]
+            [item.model_dump() for item in request.pii_list],
+            ledger_db_path=request.ledger_db_path,
+            ledger_passphrase=request.ledger_passphrase,
         )
         return result
     except ValueError as e:
@@ -129,6 +198,93 @@ async def redact_file_endpoint(request: RedactRequest):
     except Exception as e:
         logger.error(f"Redact failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ledger/init")
+async def ledger_init(request: LedgerInitRequest):
+    logger.info("Ledger init request")
+    try:
+        with EncryptedLedger(
+            request.db_path,
+            request.passphrase,
+            kdf_iterations=request.kdf_iterations,
+        ):
+            pass
+        return {"status": "ok", "db_path": os.path.expanduser(request.db_path)}
+    except Exception as exc:
+        logger.error("Ledger init failed")
+        raise _ledger_http_error(exc)
+
+
+@app.post("/ledger/insert")
+async def ledger_insert(request: LedgerInsertRequest):
+    logger.info("Ledger insert request: %s", request.type)
+    try:
+        with EncryptedLedger(request.db_path, request.passphrase) as ledger:
+            inserted_id = EncryptedLedger.retrying(
+                lambda: ledger.insert_entry(
+                    request.type,
+                    request.source,
+                    request.payload,
+                    request.metadata,
+                )
+            )
+        return {"status": "ok", "id": inserted_id}
+    except Exception as exc:
+        logger.error("Ledger insert failed")
+        raise _ledger_http_error(exc)
+
+
+@app.post("/ledger/query")
+async def ledger_query(request: LedgerQueryRequest):
+    logger.info("Ledger query request")
+    try:
+        sql = request.sql.strip()
+        if " limit " not in f" {sql.lower()} ":
+            sql = f"{sql} LIMIT ? OFFSET ?"
+            params = [*request.params, request.limit, request.offset]
+        else:
+            params = request.params
+        with EncryptedLedger(request.db_path, request.passphrase) as ledger:
+            rows = ledger.select(sql, tuple(params))
+        return {"status": "ok", "rows": rows}
+    except Exception as exc:
+        logger.error("Ledger query failed")
+        raise _ledger_http_error(exc)
+
+
+@app.post("/ledger/backup")
+async def ledger_backup(request: LedgerBackupRequest):
+    logger.info("Ledger backup request")
+    try:
+        with EncryptedLedger(request.db_path, request.passphrase) as ledger:
+            ledger.backup(request.out_path)
+        return {"status": "ok", "out_path": os.path.expanduser(request.out_path)}
+    except Exception as exc:
+        logger.error("Ledger backup failed")
+        raise _ledger_http_error(exc)
+
+
+@app.post("/ledger/rotate-key")
+async def ledger_rotate_key(request: LedgerRotateKeyRequest):
+    logger.info("Ledger rotate-key request")
+    try:
+        with EncryptedLedger(request.db_path, request.old_passphrase) as ledger:
+            ledger.rotate_key(
+                request.old_passphrase,
+                request.new_passphrase,
+                request.new_kdf_iterations,
+            )
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.error("Ledger rotate-key failed")
+        raise _ledger_http_error(exc)
+
+
+@app.post("/ledger/close")
+async def ledger_close(request: LedgerCloseRequest):
+    logger.info("Ledger close request")
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
