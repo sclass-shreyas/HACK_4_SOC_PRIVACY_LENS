@@ -3,9 +3,22 @@ import json
 import logging
 from pathlib import Path
 from typing import List, Dict, Optional
-import PyPDF2
 import sqlite3
-import pandas as pd
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +125,7 @@ class FileCrawler:
             elif ext == '.db' or 'sqlite' in filepath.lower():
                 file_info['content'] = self._extract_sqlite_text(filepath)
                 stats['dbs'] += 1
-            elif ext in ['.txt', '.log', '.csv']:
+            elif ext in ['.txt', '.log', '.csv', '.local', '.env'] or self._looks_like_text_config(filepath):
                 file_info['content'] = self._extract_plaintext(filepath)
                 stats['text_files'] += 1
             else:
@@ -126,6 +139,16 @@ class FileCrawler:
 
     def _extract_pdf_text(self, filepath: str) -> str:
         """Extract text from PDF file."""
+        if fitz:
+            try:
+                with fitz.open(filepath) as doc:
+                    return ''.join(page.get_text() for page in doc[:10])[:5000]
+            except Exception as e:
+                logger.warning(f"PyMuPDF extraction failed for {filepath}: {e}")
+
+        if not PyPDF2:
+            return self._extract_plaintext(filepath)
+
         try:
             with open(filepath, 'rb') as f:
                 pdf_reader = PyPDF2.PdfReader(f)
@@ -139,6 +162,11 @@ class FileCrawler:
 
     def _extract_csv_text(self, filepath: str) -> str:
         """Extract text from CSV/Excel file."""
+        if not pd:
+            if filepath.endswith('.xlsx'):
+                return ''
+            return self._extract_plaintext(filepath)
+
         try:
             if filepath.endswith('.xlsx'):
                 df = pd.read_excel(filepath, nrows=100)
@@ -206,6 +234,11 @@ class FileCrawler:
         else:
             return 'text'
 
+    def _looks_like_text_config(self, filepath: str) -> bool:
+        """Detect text-like config files whose final suffix is not enough."""
+        name = os.path.basename(filepath).lower()
+        return any(marker in name for marker in ['config', 'credentials', 'secrets', 'password'])
+
 
 # Test the crawler
 if __name__ == '__main__':
@@ -216,8 +249,8 @@ if __name__ == '__main__':
     
     if os.path.exists(test_dir):
         results = crawler.scan(test_dir)
-        print(f"\n✓ Crawl complete: {results['stats']['total_files']} files found")
-        print(f"✓ Content extracted from {len([f for f in results['files'] if f])} files")
+        print(f"\nOK Crawl complete: {results['stats']['total_files']} files found")
+        print(f"OK Content extracted from {len([f for f in results['files'] if f])} files")
         if results['errors']:
             print(f"! {len(results['errors'])} errors")
     else:
