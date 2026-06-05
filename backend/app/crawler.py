@@ -4,6 +4,8 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 import sqlite3
+import shutil
+import tempfile
 
 try:
     import fitz  # PyMuPDF
@@ -142,7 +144,12 @@ class FileCrawler:
         if fitz:
             try:
                 with fitz.open(filepath) as doc:
-                    return ''.join(page.get_text() for page in doc[:10])[:5000]
+                    text = ''
+                    for page_number, page in enumerate(doc):
+                        if page_number >= 10:
+                            break
+                        text += page.get_text()
+                    return text[:5000]
             except Exception as e:
                 logger.warning(f"PyMuPDF extraction failed for {filepath}: {e}")
 
@@ -189,8 +196,15 @@ class FileCrawler:
 
     def _extract_sqlite_text(self, filepath: str) -> str:
         """Extract text from SQLite database (e.g., Chrome autofill)."""
+        tmp_path = None
+        conn = None
         try:
-            conn = sqlite3.connect(filepath)
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+            tmp_path = tmp_file.name
+            tmp_file.close()
+            shutil.copy2(filepath, tmp_path)
+
+            conn = sqlite3.connect(tmp_path)
             cursor = conn.cursor()
             
             # Chrome autofill and cookies tables
@@ -205,11 +219,18 @@ class FileCrawler:
                 except:
                     pass
             
-            conn.close()
             return text
         except Exception as e:
             logger.error(f"SQLite extraction failed for {filepath}: {e}")
             return ''
+        finally:
+            if conn:
+                conn.close()
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _extract_plaintext(self, filepath: str) -> str:
         """Extract text from plain text file."""
