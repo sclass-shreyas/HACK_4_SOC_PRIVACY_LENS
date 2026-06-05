@@ -2,8 +2,10 @@ import os
 import json
 import logging
 import sys
+import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Any, Generator, List, Dict, Optional
 import sqlite3
 import shutil
 import tempfile
@@ -50,6 +52,11 @@ class FileCrawler:
         '.mp3', '.mp4', '.mov', '.avi', '.mkv'
     }
 
+    CHAT_MARKERS = {
+        'whatsapp': ['whatsapp chat', 'end-to-end encrypted', 'messages and calls are end-to-end encrypted'],
+        'telegram': ['telegram', 'from_id', 'text_entities']
+    }
+
     def __init__(self, max_depth: int = 5, max_files: int = 5000, max_file_size_mb: int = 25):
         self.max_depth = max_depth
         self.max_files = max_files
@@ -79,6 +86,7 @@ class FileCrawler:
                 'pdfs': 0,
                 'csvs': 0,
                 'dbs': 0,
+                'chats': 0,
                 'skipped_large_files': 0,
                 'permission_errors': 0,
                 'paths_scanned': 0
@@ -102,26 +110,82 @@ class FileCrawler:
 
         return merged
 
+    def scan_iter(self, directory: str) -> Generator[Dict[str, Any], None, None]:
+        """Yield scan progress events as files are processed."""
+        logger.info(f"Starting streaming crawl of: {directory}")
+        results = self._empty_results()
+
+        try:
+            directory = os.path.expanduser(directory)
+            if not os.path.isdir(directory):
+                raise ValueError(f"Directory not found: {directory}")
+
+            results['stats']['paths_scanned'] = 1
+            yield {'event': 'start', 'directory': directory}
+
+            def on_walk_error(error):
+                logger.warning(f"Permission/path error during crawl: {error}")
+                payload = {'path': getattr(error, 'filename', directory), 'error': str(error)}
+                results['errors'].append(payload)
+                if isinstance(error, PermissionError):
+                    results['stats']['permission_errors'] += 1
+                yield_event = {'event': 'error', **payload}
+                results.setdefault('_pending_events', []).append(yield_event)
+
+            for root, dirs, files in os.walk(directory, onerror=on_walk_error):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+
+                for pending in results.pop('_pending_events', []):
+                    yield pending
+
+                depth = len(Path(root).relative_to(directory).parts)
+                if depth > self.max_depth:
+                    dirs[:] = []
+                    continue
+
+                for file in files:
+                    if results['stats']['total_files'] >= self.max_files:
+                        logger.warning(f"Reached max files limit: {self.max_files}")
+                        yield {'event': 'limit_reached', 'max_files': self.max_files}
+                        break
+
+                    filepath = os.path.join(root, file)
+                    try:
+                        file_result = self._process_file(filepath, results['stats'])
+                        if file_result:
+                            results['files'].append(file_result)
+                            yield {'event': 'file', 'file': file_result, 'stats': results['stats']}
+                        else:
+                            yield {'event': 'skip', 'path': filepath, 'stats': results['stats']}
+                    except PermissionError as e:
+                        logger.warning(f"Permission denied processing {filepath}: {e}")
+                        results['stats']['permission_errors'] += 1
+                        payload = {'file': filepath, 'error': str(e)}
+                        results['errors'].append(payload)
+                        yield {'event': 'error', **payload, 'stats': results['stats']}
+                    except Exception as e:
+                        logger.error(f"Error processing {filepath}: {e}")
+                        payload = {'file': filepath, 'error': str(e)}
+                        results['errors'].append(payload)
+                        yield {'event': 'error', **payload, 'stats': results['stats']}
+
+                if results['stats']['total_files'] >= self.max_files:
+                    break
+
+        except Exception as e:
+            logger.error(f"Crawl error: {e}")
+            results['errors'].append({'crawl': str(e)})
+            yield {'event': 'error', 'crawl': str(e)}
+
+        yield {'event': 'complete', 'files': results['files'], 'errors': results['errors'], 'stats': results['stats']}
+
     def scan(self, directory: str) -> Dict:
         """
         Scan a directory and extract text from files.
         Returns: {files: [...], errors: [...], stats: {...}}
         """
         logger.info(f"Starting crawl of: {directory}")
-        results = {
-            'files': [],
-            'errors': [],
-            'stats': {
-                'total_files': 0,
-                'text_files': 0,
-                'pdfs': 0,
-                'csvs': 0,
-                'dbs': 0,
-                'skipped_large_files': 0,
-                'permission_errors': 0,
-                'paths_scanned': 0
-            }
-        }
+        results = self._empty_results()
 
         try:
             directory = os.path.expanduser(directory)
@@ -190,6 +254,7 @@ class FileCrawler:
             'content': '',
             'file_type': self._detect_file_type(filepath),
         }
+        file_info['metadata'] = self._build_file_metadata(filepath, file_info['size'], file_info['modified'])
 
         if file_info['size'] > self.max_file_size_bytes:
             stats['skipped_large_files'] += 1
@@ -197,7 +262,13 @@ class FileCrawler:
             return None
 
         try:
-            if ext == '.pdf':
+            if self._looks_like_chat_log(filepath):
+                chat_data = self._extract_chat_text(filepath)
+                file_info['content'] = chat_data['content']
+                file_info['file_type'] = 'chat_log'
+                file_info['metadata'].update(chat_data['metadata'])
+                stats['chats'] += 1
+            elif ext == '.pdf':
                 file_info['content'] = self._extract_pdf_text(filepath)
                 stats['pdfs'] += 1
             elif ext in ['.csv', '.xlsx']:
@@ -275,6 +346,86 @@ class FileCrawler:
             logger.error(f"JSON extraction failed for {filepath}: {e}")
             return ''
 
+    def _extract_chat_text(self, filepath: str) -> Dict[str, Any]:
+        """Parse WhatsApp/Telegram exports into searchable text and metadata."""
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == '.json':
+            return self._extract_telegram_json(filepath)
+        return self._extract_whatsapp_text(filepath)
+
+    def _extract_telegram_json(self, filepath: str) -> Dict[str, Any]:
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            messages = data.get('messages', []) if isinstance(data, dict) else data
+            lines = []
+            participants = set()
+            message_count = 0
+
+            for message in messages[:500]:
+                if not isinstance(message, dict):
+                    continue
+                text = message.get('text', '')
+                if isinstance(text, list):
+                    text = ''.join(part if isinstance(part, str) else part.get('text', '') for part in text)
+                if not str(text).strip():
+                    continue
+
+                sender = str(message.get('from') or message.get('from_id') or 'unknown')
+                participants.add(sender)
+                message_count += 1
+                lines.append(f"{message.get('date', '')} {sender}: {text}")
+
+            return {
+                'content': '\n'.join(lines)[:5000],
+                'metadata': {
+                    'chat_platform': 'telegram',
+                    'chat_message_count': message_count,
+                    'chat_participant_count': len(participants),
+                    'chat_participants_sample': sorted(participants)[:10],
+                }
+            }
+        except Exception as e:
+            logger.error(f"Telegram chat extraction failed for {filepath}: {e}")
+            return {'content': '', 'metadata': {'chat_platform': 'telegram', 'chat_parse_error': str(e)}}
+
+    def _extract_whatsapp_text(self, filepath: str) -> Dict[str, Any]:
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                raw_text = f.read()[:50000]
+
+            message_pattern = re.compile(
+                r'^(?:\[\d{1,2}/\d{1,2}/\d{2,4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\]\s*|\d{1,2}/\d{1,2}/\d{2,4},?\s+\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?\s+-\s*)([^:]+):\s*(.*)$'
+            )
+            participants = set()
+            message_count = 0
+            lines = []
+
+            for line in raw_text.splitlines():
+                match = message_pattern.match(line.strip())
+                if match:
+                    sender = match.group(1).strip()
+                    participants.add(sender)
+                    message_count += 1
+                    lines.append(f"{sender}: {match.group(2).strip()}")
+                elif lines and line.strip():
+                    lines[-1] += f" {line.strip()}"
+
+            content = '\n'.join(lines) if lines else raw_text
+            return {
+                'content': content[:5000],
+                'metadata': {
+                    'chat_platform': 'whatsapp',
+                    'chat_message_count': message_count,
+                    'chat_participant_count': len(participants),
+                    'chat_participants_sample': sorted(participants)[:10],
+                }
+            }
+        except Exception as e:
+            logger.error(f"WhatsApp chat extraction failed for {filepath}: {e}")
+            return {'content': '', 'metadata': {'chat_platform': 'whatsapp', 'chat_parse_error': str(e)}}
+
     def _extract_sqlite_text(self, filepath: str) -> str:
         """Extract text from SQLite database (e.g., Chrome autofill)."""
         tmp_path = None
@@ -325,6 +476,8 @@ class FileCrawler:
     def _detect_file_type(self, filepath: str) -> str:
         """Detect file type for categorization."""
         ext = os.path.splitext(filepath)[1].lower()
+        if self._looks_like_chat_log(filepath):
+            return 'chat_log'
         if ext == '.pdf':
             return 'pdf'
         elif ext in ['.csv', '.xlsx']:
@@ -340,6 +493,55 @@ class FileCrawler:
         """Detect text-like config files whose final suffix is not enough."""
         name = os.path.basename(filepath).lower()
         return any(marker in name for marker in ['config', 'credentials', 'secrets', 'password'])
+
+    def _looks_like_chat_log(self, filepath: str) -> bool:
+        """Detect WhatsApp and Telegram export files."""
+        name = os.path.basename(filepath).lower()
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in {'.txt', '.json'}:
+            return False
+        chat_name_markers = ['whatsapp chat', 'whatsapp', 'telegram', 'chat_history', 'chat export', 'result.json']
+        return any(marker in name for marker in chat_name_markers)
+
+    def _build_file_metadata(self, filepath: str, size: int, modified: float) -> Dict[str, Any]:
+        """Build scorer-friendly metadata such as age and location risk."""
+        now = datetime.now(timezone.utc)
+        modified_dt = datetime.fromtimestamp(modified, timezone.utc)
+        path_lower = filepath.lower()
+
+        location_risk = 'low'
+        if any(marker in path_lower for marker in ['appdata', 'library/application support', '.config', 'chrome', 'firefox']):
+            location_risk = 'high'
+        elif any(marker in path_lower for marker in ['downloads', 'desktop', 'onedrive']):
+            location_risk = 'medium'
+
+        return {
+            'filename': os.path.basename(filepath),
+            'extension': os.path.splitext(filepath)[1].lower(),
+            'directory': os.path.dirname(filepath),
+            'size_bytes': size,
+            'modified_unix': modified,
+            'modified_iso': modified_dt.isoformat(),
+            'age_days': max(0, int((now - modified_dt).total_seconds() // 86400)),
+            'location_risk': location_risk,
+        }
+
+    def _empty_results(self) -> Dict[str, Any]:
+        return {
+            'files': [],
+            'errors': [],
+            'stats': {
+                'total_files': 0,
+                'text_files': 0,
+                'pdfs': 0,
+                'csvs': 0,
+                'dbs': 0,
+                'chats': 0,
+                'skipped_large_files': 0,
+                'permission_errors': 0,
+                'paths_scanned': 0
+            }
+        }
 
 
 # Test the crawler
