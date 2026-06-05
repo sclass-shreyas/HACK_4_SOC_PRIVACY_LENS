@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Any, List
+from typing import Any, List, Optional
 import logging
 import os
 
@@ -81,7 +81,11 @@ logger = logging.getLogger(__name__)
 
 
 class ScanRequest(BaseModel):
-    directory: str
+    directory: Optional[str] = None
+    directories: Optional[List[str]] = None
+    max_depth: int = 5
+    max_files: int = 5000
+    max_file_size_mb: int = 25
 
 
 def _ledger_http_error(exc: Exception) -> HTTPException:
@@ -120,15 +124,34 @@ async def scan_filesystem(request: ScanRequest):
     Scan a directory for sensitive files.
     Returns: {files: [...], errors: [...]}
     """
-    directory = os.path.expanduser(request.directory)
-    logger.info(f"Scan request for: {directory}")
+    crawler = FileCrawler(
+        max_depth=request.max_depth,
+        max_files=request.max_files,
+        max_file_size_mb=request.max_file_size_mb
+    )
 
-    if not os.path.isdir(directory):
-        raise HTTPException(status_code=404, detail=f"Directory not found: {directory}")
+    if request.directories:
+        directories = [os.path.expanduser(directory) for directory in request.directories]
+        logger.info(f"Scan request for {len(directories)} directories")
 
-    crawler = FileCrawler()
-    results = crawler.scan(directory)
-    results["files"] = [file for file in results["files"] if file]
+        missing = [directory for directory in directories if not os.path.isdir(directory)]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"Directory not found: {missing[0]}")
+
+        results = crawler.scan_many(directories)
+    elif request.directory:
+        directory = os.path.expanduser(request.directory)
+        logger.info(f"Scan request for: {directory}")
+
+        if not os.path.isdir(directory):
+            raise HTTPException(status_code=404, detail=f"Directory not found: {directory}")
+
+        results = crawler.scan(directory)
+    else:
+        directories = [directory for directory in crawler.default_scan_paths() if os.path.isdir(directory)]
+        logger.info(f"Default scan request for {len(directories)} directories")
+        results = crawler.scan_many(directories)
+
     return results
 
 @app.post("/classify")

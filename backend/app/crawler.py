@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import List, Dict, Optional
 import sqlite3
@@ -28,10 +29,11 @@ class FileCrawler:
     """Crawls filesystem for sensitive files and extracts text content."""
     
     SCAN_PATHS = {
-        'linux': ['~/Downloads', '~/Documents', '~/.config/google-chrome', '~/.mozilla/firefox'],
-        'darwin': ['~/Downloads', '~/Documents', '~/Library/Application Support/Google/Chrome', 
+        'linux': ['~/Downloads', '~/Documents', '~/Desktop', '~/.config/google-chrome', '~/.mozilla/firefox'],
+        'darwin': ['~/Downloads', '~/Documents', '~/Desktop', '~/Library/Application Support/Google/Chrome',
                    '~/Library/Application Support/Firefox'],
-        'win32': ['~/Downloads', '~/Documents', '~/AppData/Local/Google/Chrome', 
+        'win32': ['~/Downloads', '~/Documents', '~/Desktop', '~/OneDrive/Downloads',
+                  '~/OneDrive/Documents', '~/OneDrive/Desktop', '~/AppData/Local/Google/Chrome',
                   '~/AppData/Roaming/Mozilla/Firefox']
     }
     
@@ -48,10 +50,57 @@ class FileCrawler:
         '.mp3', '.mp4', '.mov', '.avi', '.mkv'
     }
 
-    def __init__(self, max_depth: int = 5, max_files: int = 5000):
+    def __init__(self, max_depth: int = 5, max_files: int = 5000, max_file_size_mb: int = 25):
         self.max_depth = max_depth
         self.max_files = max_files
+        self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
         self.files_found = []
+
+    @classmethod
+    def default_scan_paths(cls) -> List[str]:
+        """Return existing default paths for the current platform."""
+        platform_paths = cls.SCAN_PATHS.get(sys.platform, cls.SCAN_PATHS.get('linux', []))
+        expanded_paths = [os.path.expanduser(path) for path in platform_paths]
+        return list(dict.fromkeys(expanded_paths))
+
+    def scan_defaults(self) -> Dict:
+        """Scan all existing default paths for the current platform."""
+        return self.scan_many(self.default_scan_paths())
+
+    def scan_many(self, directories: List[str]) -> Dict:
+        """Scan several directories and merge their crawl results."""
+        original_max_files = self.max_files
+        merged = {
+            'files': [],
+            'errors': [],
+            'stats': {
+                'total_files': 0,
+                'text_files': 0,
+                'pdfs': 0,
+                'csvs': 0,
+                'dbs': 0,
+                'skipped_large_files': 0,
+                'permission_errors': 0,
+                'paths_scanned': 0
+            }
+        }
+
+        try:
+            for directory in directories:
+                remaining_files = original_max_files - merged['stats']['total_files']
+                if remaining_files <= 0:
+                    break
+
+                self.max_files = remaining_files
+                results = self.scan(directory)
+                merged['files'].extend(results['files'])
+                merged['errors'].extend(results['errors'])
+                for key, value in results['stats'].items():
+                    merged['stats'][key] = merged['stats'].get(key, 0) + value
+        finally:
+            self.max_files = original_max_files
+
+        return merged
 
     def scan(self, directory: str) -> Dict:
         """
@@ -62,7 +111,16 @@ class FileCrawler:
         results = {
             'files': [],
             'errors': [],
-            'stats': {'total_files': 0, 'text_files': 0, 'pdfs': 0, 'csvs': 0, 'dbs': 0}
+            'stats': {
+                'total_files': 0,
+                'text_files': 0,
+                'pdfs': 0,
+                'csvs': 0,
+                'dbs': 0,
+                'skipped_large_files': 0,
+                'permission_errors': 0,
+                'paths_scanned': 0
+            }
         }
 
         try:
@@ -70,25 +128,43 @@ class FileCrawler:
             if not os.path.isdir(directory):
                 raise ValueError(f"Directory not found: {directory}")
 
-            for root, dirs, files in os.walk(directory):
+            results['stats']['paths_scanned'] = 1
+
+            def on_walk_error(error):
+                logger.warning(f"Permission/path error during crawl: {error}")
+                results['errors'].append({'path': getattr(error, 'filename', directory), 'error': str(error)})
+                if isinstance(error, PermissionError):
+                    results['stats']['permission_errors'] += 1
+
+            for root, dirs, files in os.walk(directory, onerror=on_walk_error):
                 # Skip hidden directories
                 dirs[:] = [d for d in dirs if not d.startswith('.')]
                 
                 depth = len(Path(root).relative_to(directory).parts)
                 if depth > self.max_depth:
+                    dirs[:] = []
                     continue
 
                 for file in files:
-                    if len(results['files']) >= self.max_files:
+                    if results['stats']['total_files'] >= self.max_files:
                         logger.warning(f"Reached max files limit: {self.max_files}")
                         break
 
                     filepath = os.path.join(root, file)
                     try:
-                        results['files'].append(self._process_file(filepath, results['stats']))
+                        file_result = self._process_file(filepath, results['stats'])
+                        if file_result:
+                            results['files'].append(file_result)
+                    except PermissionError as e:
+                        logger.warning(f"Permission denied processing {filepath}: {e}")
+                        results['stats']['permission_errors'] += 1
+                        results['errors'].append({'file': filepath, 'error': str(e)})
                     except Exception as e:
                         logger.error(f"Error processing {filepath}: {e}")
                         results['errors'].append({'file': filepath, 'error': str(e)})
+
+                if results['stats']['total_files'] >= self.max_files:
+                    break
 
         except Exception as e:
             logger.error(f"Crawl error: {e}")
@@ -114,6 +190,11 @@ class FileCrawler:
             'content': '',
             'file_type': self._detect_file_type(filepath),
         }
+
+        if file_info['size'] > self.max_file_size_bytes:
+            stats['skipped_large_files'] += 1
+            logger.info(f"Skipping large file: {filepath} ({file_info['size']} bytes)")
+            return None
 
         try:
             if ext == '.pdf':
