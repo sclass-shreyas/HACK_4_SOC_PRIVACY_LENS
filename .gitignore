@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.env
+
+# Node/npm
+node_modules/
+npm-debug.log
+yarn-error.log
+dist/
+build/
+
+# Electron
+electron/dist/
+electron-builder/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*.test.js
+*.test.py
+__pycache__
+
+# Sensitive
+.env.local
+.env.*.local
+assets/test_data/sensitive/*
+!assets/test_data/sensitive/.gitkeep
+
+# Build artifacts
+*.o
+*.a
+*.so
+.next/
+out/
+
+# Logs
+logs/
+*.log
