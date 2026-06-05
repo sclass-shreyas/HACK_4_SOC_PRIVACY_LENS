@@ -10,7 +10,7 @@ import {
   transformScanToTreemapData,
 } from './lib/treemapUtils';
 
-const API_BASE = 'http://127.0.0.1:5000';
+const API_BASE = 'http://127.0.0.1:5001';
 const DEFAULT_SCAN_DIR =
   (typeof process !== 'undefined' && process.env?.REACT_APP_TEST_DIR) ||
   '~/privacylens_test_data';
@@ -67,7 +67,7 @@ function friendlyError(error) {
     return `${detail}. The file may be locked by OneDrive or another app; close it and retry.`;
   }
   if (/network|failed|ECONNREFUSED/i.test(detail)) {
-    return 'Backend is offline. Start the backend on http://127.0.0.1:5000 and retry.';
+    return 'Backend is offline. Start the backend on http://127.0.0.1:5001 and retry.';
   }
   return detail;
 }
