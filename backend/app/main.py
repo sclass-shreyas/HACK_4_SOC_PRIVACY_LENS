@@ -1,10 +1,31 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List
 import logging
 import os
 
 from app.crawler import FileCrawler
+from app.remediation import secure_delete, encrypt_file, redact_file
+
+
+class ShredRequest(BaseModel):
+    filepath: str
+
+
+class EncryptRequest(BaseModel):
+    filepath: str
+    password: str
+
+
+class PiiItem(BaseModel):
+    value: str
+    pii_type: str
+
+
+class RedactRequest(BaseModel):
+    filepath: str
+    pii_list: List[PiiItem]
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +90,45 @@ async def calculate_privacy_score(files_data: dict):
     """
     logger.info("Privacy score calculation request")
     return {"status": "not_implemented"}
+
+@app.post("/remediate/shred")
+async def shred_file(request: ShredRequest):
+    """Securely overwrite and delete a file."""
+    try:
+        result = secure_delete(request.filepath)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Shred failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/remediate/encrypt")
+async def encrypt_file_endpoint(request: EncryptRequest):
+    """AES-encrypt a file and shred the original."""
+    try:
+        result = encrypt_file(request.filepath, request.password)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Encrypt failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/remediate/redact")
+async def redact_file_endpoint(request: RedactRequest):
+    """Replace detected PII strings with [REDACTED] in-place."""
+    try:
+        result = redact_file(
+            request.filepath,
+            [item.model_dump() for item in request.pii_list]
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Redact failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
