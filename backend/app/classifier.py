@@ -32,24 +32,59 @@ class PIIClassifier:
     }
 
     def __init__(self, model_path: str = 'assets/models/distilbert-ner.onnx'):
-        """Initialize classifier with ONNX model."""
+        """Initialize classifier with NER backend fallback."""
         self.model_path = model_path
         self.session = None
+        self.pytorch_model = None
         self.tokenizer = None
+        self.backend = "regex"
         self._load_model()
 
     def _load_model(self):
-        """Load ONNX model and tokenizer."""
+        """Load NER backend with ONNX, PyTorch, then regex-only fallback."""
+        tokenizer_path = 'assets/models/distilbert-ner'
+        tokenizer_fallback = 'elastic/distilbert-base-uncased-finetuned-conll03-english'
+
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        except Exception as e:
+            logger.warning(f"Local tokenizer load failed: {e}. Trying HuggingFace fallback.")
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_fallback)
+            except Exception as tokenizer_error:
+                logger.warning(f"Tokenizer load failed: {tokenizer_error}. NER disabled.")
+                self.session = None
+                self.pytorch_model = None
+                self.backend = "regex"
+                logger.info(f"NER backend: {self.backend}")
+                return
+
         try:
             self.session = ort.InferenceSession(
                 self.model_path,
                 providers=['CPUExecutionProvider']
             )
-            self.tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
-            logger.info("✓ ONNX model loaded successfully")
+            self.pytorch_model = None
+            self.backend = "onnx"
         except Exception as e:
-            logger.warning(f"ONNX model load failed: {e}. Using regex fallback.")
+            logger.warning(f"ONNX model load failed: {e}. Trying PyTorch fallback.")
             self.session = None
+            try:
+                from transformers import AutoModelForTokenClassification
+
+                self.pytorch_model = AutoModelForTokenClassification.from_pretrained(
+                    'assets/models/distilbert-ner'
+                )
+                self.pytorch_model.eval()
+                self.session = self.pytorch_model
+                self.backend = "pytorch"
+            except Exception as pytorch_error:
+                logger.warning(f"PyTorch model load failed: {pytorch_error}. Using regex fallback.")
+                self.session = None
+                self.pytorch_model = None
+                self.backend = "regex"
+
+        logger.info(f"NER backend: {self.backend}")
 
     def classify(self, text: str) -> Dict:
         """
@@ -112,7 +147,7 @@ class PIIClassifier:
         return results
 
     def _classify_ner(self, text: str) -> Dict:
-        """NER-based PII classification using DistilBERT."""
+        """NER-based PII classification using ONNX or PyTorch."""
         results = {
             'types': [],
             'confidence': [],
@@ -120,39 +155,104 @@ class PIIClassifier:
             'categories': set()
         }
 
-        if not self.session:
+        if self.backend == "regex":
             return results
 
+        def append_entity(entity):
+            char_start = entity['start']
+            char_end = entity['end']
+            label = entity['label']
+            entity_text = text[char_start:char_end]
+
+            if not entity_text.strip():
+                return
+
+            excerpt = text[max(0, char_start - 50):min(len(text), char_end + 50)]
+            results['types'].append(label)
+            results['confidence'].append(float(np.mean(entity['confidence'])))
+            results['excerpts'].append(excerpt)
+            results['categories'].add(self._map_entity_to_category(label))
+
         try:
-            # Tokenize
             inputs = self.tokenizer(
                 text,
-                return_tensors='np',
+                return_tensors="np" if self.backend == "onnx" else "pt",
                 truncation=True,
                 max_length=512,
-                padding=True
+                padding=True,
+                return_token_type_ids=True,
+                return_offsets_mapping=True
             )
+            offset_mapping = inputs.pop("offset_mapping")
 
-            # Run inference
-            input_names = [input.name for input in self.session.get_inputs()]
-            input_feed = {name: inputs[key].numpy() for name, key in zip(input_names, inputs.keys())}
-            outputs = self.session.run(None, input_feed)
+            if self.backend == "onnx":
+                onnx_input_names = [inp.name for inp in self.session.get_inputs()]
+                if "token_type_ids" in onnx_input_names and "token_type_ids" not in inputs:
+                    inputs["token_type_ids"] = np.zeros_like(inputs["input_ids"])
+                input_feed = {
+                    name: np.asarray(inputs[name], dtype=np.int64)
+                    for name in onnx_input_names
+                    if name in inputs
+                }
+                outputs = self.session.run(None, input_feed)
+                logits = outputs[0]
+                offsets = offset_mapping[0]
+            elif self.backend == "pytorch":
+                import torch
 
-            # Parse outputs
-            logits = outputs[0]
-            predictions = np.argmax(logits, axis=2)
-            
-            # Simple entity extraction (this is a simplified version)
-            # In production, you'd decode the token predictions properly
-            entity_labels = {0: 'O', 1: 'B-PER', 2: 'I-PER', 3: 'B-ORG', 4: 'I-ORG', 
-                             5: 'B-LOC', 6: 'I-LOC'}
-            
+                inputs.pop("token_type_ids", None)
+                with torch.no_grad():
+                    logits = self.pytorch_model(**inputs).logits.cpu().numpy()
+                offsets = offset_mapping[0].cpu().numpy()
+            else:
+                return results
+
+            exp_logits = np.exp(logits - np.max(logits, axis=2, keepdims=True))
+            probabilities = exp_logits / np.sum(exp_logits, axis=2, keepdims=True)
+            predictions = np.argmax(probabilities, axis=2)
+
+            ID2LABEL = {
+                0: "O",
+                1: "B-PER", 2: "I-PER",
+                3: "B-ORG", 4: "I-ORG",
+                5: "B-LOC", 6: "I-LOC",
+                7: "B-MISC", 8: "I-MISC"
+            }
+
+            current_entity = None
+
             for i, pred in enumerate(predictions[0]):
-                label = entity_labels.get(pred, 'O')
-                if label != 'O':
-                    results['types'].append(label)
-                    results['confidence'].append(float(np.max(logits[0][i])))
-                    results['categories'].add(self._map_entity_to_category(label))
+                label = ID2LABEL.get(int(pred), 'O')
+                char_start, char_end = int(offsets[i][0]), int(offsets[i][1])
+
+                if char_start == char_end:
+                    continue
+
+                if label == 'O':
+                    if current_entity:
+                        append_entity(current_entity)
+                        current_entity = None
+                    continue
+
+                prefix, entity_type = label.split('-', 1)
+                confidence = float(probabilities[0][i][int(pred)])
+
+                if not current_entity or current_entity['entity_type'] != entity_type:
+                    if current_entity:
+                        append_entity(current_entity)
+                    current_entity = {
+                        'label': f'B-{entity_type}',
+                        'entity_type': entity_type,
+                        'start': char_start,
+                        'end': char_end,
+                        'confidence': [confidence]
+                    }
+                else:
+                    current_entity['end'] = char_end
+                    current_entity['confidence'].append(confidence)
+
+            if current_entity:
+                append_entity(current_entity)
 
         except Exception as e:
             logger.error(f"NER classification error: {e}")

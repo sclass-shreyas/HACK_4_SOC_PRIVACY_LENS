@@ -41,6 +41,9 @@ __pycache__
 assets/test_data/sensitive/*
 !assets/test_data/sensitive/.gitkeep
 
+# Generated ML model assets
+backend/assets/models/
+
 # Build artifacts
 *.o
 *.a
