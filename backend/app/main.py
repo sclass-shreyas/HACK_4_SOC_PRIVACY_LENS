@@ -1,11 +1,18 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import logging
 import os
+
+from app.crawler import FileCrawler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class ScanRequest(BaseModel):
+    directory: str
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -28,15 +35,22 @@ app.add_middleware(
 async def health_check():
     return {"status": "ok", "service": "PrivacyLens Backend"}
 
-# Placeholder endpoints (will be implemented during hackathon)
 @app.post("/scan")
-async def scan_filesystem(directory: str):
+async def scan_filesystem(request: ScanRequest):
     """
     Scan a directory for sensitive files.
     Returns: {files: [...], errors: [...]}
     """
+    directory = os.path.expanduser(request.directory)
     logger.info(f"Scan request for: {directory}")
-    return {"status": "not_implemented"}
+
+    if not os.path.isdir(directory):
+        raise HTTPException(status_code=404, detail=f"Directory not found: {directory}")
+
+    crawler = FileCrawler()
+    results = crawler.scan(directory)
+    results["files"] = [file for file in results["files"] if file]
+    return results
 
 @app.post("/classify")
 async def classify_pii(text: str):
