@@ -162,6 +162,19 @@ function AppContent() {
     return Math.round((currentRisk / maxRisk) * 100);
   }, [treeData]);
 
+  const scoreTone = privacyScore >= 70 ? 'critical' : privacyScore >= 35 ? 'elevated' : 'calm';
+
+  const scanMetrics = useMemo(() => {
+    const files = treeData.files || [];
+    const piiTypes = new Set(files.flatMap((file) => file.topPiiTypes || file.pii || []));
+    return {
+      files: files.length,
+      highRisk: files.filter((file) => (file.severity || 0) >= 3).length,
+      piiTypes: piiTypes.size,
+      categories: treeData.children?.length || 0,
+    };
+  }, [treeData]);
+
   const handleScan = async () => {
     setScanning(true);
     setToast(null);
@@ -220,35 +233,56 @@ function AppContent() {
   return (
     <div className="app-container dark-theme">
       <header className="app-header">
-        <div>
-          <h1>PrivacyLens</h1>
-          <p>Offline Privacy Audit Tool</p>
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden="true">PL</span>
+          <div>
+            <h1>PrivacyLens</h1>
+            <p>Offline Privacy Audit Tool</p>
+          </div>
         </div>
-        <button type="button" className="btn-primary" onClick={handleScan} disabled={scanning}>
-          {scanning ? 'Working...' : 'Scan Test Directory'}
-        </button>
+        <div className="header-actions">
+          <span className={`scan-pulse ${scanning ? 'is-active' : ''}`} aria-hidden="true" />
+          <button type="button" className="btn-primary btn-scan" onClick={handleScan} disabled={scanning}>
+            {scanning ? 'Scanning...' : 'Scan Test Directory'}
+          </button>
+        </div>
       </header>
 
       <main className="dashboard-layout">
-        <section className="score-band" aria-label="Privacy score summary">
-          <div>
-            <span className="eyebrow">Privacy debt</span>
-            <strong>{privacyScore}</strong>
-            <span>out of 100</span>
+        <section className={`score-band score-${scoreTone}`} aria-label="Privacy score summary">
+          <div className="score-orb" style={{ '--score': privacyScore }}>
+            <div className="score-ring">
+              <strong>{privacyScore}</strong>
+              <span>out of 100</span>
+            </div>
           </div>
-          <label>
-            Aggregate
-            <select value={aggregateBy} onChange={(event) => setAggregateBy(event.target.value)}>
-              <option value="category">Category</option>
-              <option value="type">File type</option>
-              <option value="file">File</option>
-            </select>
-          </label>
+
+          <div className="score-copy">
+            <span className="eyebrow">Privacy debt</span>
+            <h2>{scoreTone === 'critical' ? 'High exposure' : scoreTone === 'elevated' ? 'Moderate exposure' : 'Low exposure'}</h2>
+            <div className="metric-row">
+              <span><strong>{scanMetrics.files}</strong> files</span>
+              <span><strong>{scanMetrics.highRisk}</strong> high risk</span>
+              <span><strong>{scanMetrics.piiTypes}</strong> PII types</span>
+              <span><strong>{scanMetrics.categories}</strong> groups</span>
+            </div>
+          </div>
+
+          <div className="score-controls">
+            <label>
+              Aggregate
+              <select value={aggregateBy} onChange={(event) => setAggregateBy(event.target.value)}>
+                <option value="category">Category</option>
+                <option value="type">File type</option>
+                <option value="file">File</option>
+              </select>
+            </label>
+          </div>
         </section>
 
         {toast && <div className={`toast toast-${toast.type}`} role="status">{toast.message}</div>}
 
-        <div className="workbench">
+        <div className={`workbench ${scanning ? 'is-scanning' : ''}`}>
           <TreemapDashboard
             data={treeData}
             aggregateBy={aggregateBy}
