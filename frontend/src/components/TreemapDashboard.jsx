@@ -326,7 +326,7 @@ export default function TreemapDashboard({
           role="menu"
           onClick={(event) => event.stopPropagation()}
         >
-          {['shred', 'encrypt', 'redact'].map((action) => (
+          {['shred', 'encrypt', 'decrypt', 'redact'].map((action) => (
             <button
               type="button"
               key={action}

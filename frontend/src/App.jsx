@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import './App.css';
 import TreemapDashboard from './components/TreemapDashboard';
@@ -48,10 +48,6 @@ async function apiPost(path, payload) {
   return axios.post(`${base}${path}`, payload);
 }
 
-const DEFAULT_SCAN_DIR =
-  (typeof process !== 'undefined' && process.env?.REACT_APP_TEST_DIR) ||
-  '~/privacylens_test_data';
-
 const SAMPLE_SCAN = {
   files: [
     {
@@ -82,6 +78,8 @@ const SAMPLE_SCAN = {
   stats: { total_files: 4, text_files: 3, csvs: 1 },
 };
 
+
+
 async function postRemediation(action, filepath, selectedFile) {
   if (action === 'shred') {
     return apiPost('/remediate/shred', { filepath });
@@ -92,10 +90,11 @@ async function postRemediation(action, filepath, selectedFile) {
     return apiPost('/remediate/encrypt', { filepath, password });
   }
   if (action === 'decrypt') {
-    const password = window.prompt('Enter the decryption passphrase.');
+    const password = window.prompt('Enter the decryption passphrase for: ' + filepath.split(/[\\/]/).pop());
     if (!password) throw new Error('Decryption cancelled: passphrase is required.');
     return apiPost('/remediate/decrypt', { filepath, password });
   }
+  // redact
   const listToUse = selectedFile?.detections || selectedFile?.pii || selectedFile?.topPiiTypes || [];
   const piiList = listToUse.map((item) => {
     if (typeof item === 'object' && item !== null) {
@@ -123,6 +122,84 @@ function friendlyError(error) {
   return detail;
 }
 
+// Scan mode: 'full' | 'custom'
+function ScanModeBar({ scanMode, setScanMode, customDir, setCustomDir, onScan, scanning }) {
+  const fileInputRef = useRef(null);
+
+  // Try Electron native dialog first, fall back to text input focus
+  const handleBrowse = async () => {
+    if (window.electronAPI?.selectDirectory) {
+      const dir = await window.electronAPI.selectDirectory();
+      if (dir) setCustomDir(dir);
+    } else {
+      fileInputRef.current?.focus();
+    }
+  };
+
+  return (
+    <div className="scan-mode-bar">
+      <div className="scan-mode-toggle">
+        <button
+          id="scan-mode-full"
+          type="button"
+          className={`scan-mode-btn ${scanMode === 'full' ? 'is-active' : ''}`}
+          onClick={() => setScanMode('full')}
+        >
+          🌐 Full System
+        </button>
+        <button
+          id="scan-mode-custom"
+          type="button"
+          className={`scan-mode-btn ${scanMode === 'custom' ? 'is-active' : ''}`}
+          onClick={() => setScanMode('custom')}
+        >
+          📁 Choose Directory
+        </button>
+      </div>
+
+      {scanMode === 'custom' && (
+        <div className="scan-dir-input-row">
+          <input
+            ref={fileInputRef}
+            id="scan-dir-input"
+            type="text"
+            className="scan-dir-input"
+            placeholder="e.g. C:\Users\you\Documents"
+            value={customDir}
+            onChange={(e) => setCustomDir(e.target.value)}
+            aria-label="Directory to scan"
+          />
+          <button
+            type="button"
+            className="btn-ghost browse-btn"
+            onClick={handleBrowse}
+            title="Browse for directory"
+          >
+            Browse
+          </button>
+        </div>
+      )}
+
+      <div className="header-scan-row">
+        <span className={`scan-pulse ${scanning ? 'is-active' : ''}`} aria-hidden="true" />
+        <button
+          id="btn-start-scan"
+          type="button"
+          className="btn-primary btn-scan"
+          onClick={onScan}
+          disabled={scanning || (scanMode === 'custom' && !customDir.trim())}
+        >
+          {scanning
+            ? 'Scanning…'
+            : scanMode === 'full'
+              ? 'Scan Entire System'
+              : 'Scan Directory'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function AppContent() {
   const [scanResults, setScanResults] = useState(SAMPLE_SCAN);
   const [aggregateBy, setAggregateBy] = useState('category');
@@ -131,6 +208,8 @@ function AppContent() {
   const [pendingAction, setPendingAction] = useState(null);
   const [removedPaths, setRemovedPaths] = useState(new Set());
   const [cleanedPaths, setCleanedPaths] = useState(new Set());
+  const [scanMode, setScanMode] = useState('custom');
+  const [customDir, setCustomDir] = useState('~/privacylens_test_data');
   const { selectedNodes, clearSelection, markCleaned, setLastQuery } = useTreemapStore();
 
   const treeData = useMemo(() => {
@@ -192,14 +271,21 @@ function AppContent() {
   const handleScan = async () => {
     setScanning(true);
     setToast(null);
-    setLastQuery(DEFAULT_SCAN_DIR);
+
+    const scanPayload =
+      scanMode === 'full'
+        ? {}
+        : { directory: customDir.trim() };
+
+    setLastQuery(scanMode === 'full' ? 'Full System' : customDir.trim());
+
     try {
-      const response = await apiPost('/scan', { directory: DEFAULT_SCAN_DIR });
+      const response = await apiPost('/scan', scanPayload);
       setScanResults(response.data);
       setRemovedPaths(new Set());
       setCleanedPaths(new Set());
       clearSelection();
-      setToast({ type: 'success', message: 'Scan loaded into treemap.' });
+      setToast({ type: 'success', message: 'Scan complete — treemap updated.' });
     } catch (error) {
       setToast({ type: 'error', message: friendlyError(error) });
     } finally {
@@ -207,9 +293,38 @@ function AppContent() {
     }
   };
 
+  // Rename file paths in scanResults (used after encrypt / decrypt)
+  const renameScanPaths = (renames) => {
+    // renames: Map<oldPath, newPath>
+    setScanResults((prev) => ({
+      ...prev,
+      files: (prev.files || []).map((f) =>
+        renames.has(f.path)
+          ? { ...f, path: renames.get(f.path), name: renames.get(f.path).split(/[\\/]/).pop() }
+          : f
+      ),
+    }));
+  };
+
   const requestRemediation = (action, paths = selectedFiles.map((file) => file.path)) => {
     const files = selectedFiles.filter((file) => paths.includes(file.path));
     if (!paths.length) return;
+
+    // Pre-flight check for decrypt — look at the actual path string
+    if (action === 'decrypt') {
+      // Accept paths if they end with .enc OR if the matching file in scanResults ends with .enc
+      const pathsToCheck = paths.length ? paths : files.map((f) => f.path);
+      const nonEnc = pathsToCheck.filter((p) => !p.endsWith('.enc'));
+      if (nonEnc.length > 0) {
+        const names = nonEnc.slice(0, 3).map((p) => p.split(/[\\/]/).pop()).join(', ');
+        setToast({
+          type: 'error',
+          message: `Decrypt only works on .enc files. These are not encrypted: ${names}${nonEnc.length > 3 ? ` (+${nonEnc.length - 3} more)` : ''}. Encrypt them first.`,
+        });
+        return;
+      }
+    }
+
     setPendingAction({ action, paths, files });
   };
 
@@ -219,21 +334,48 @@ function AppContent() {
     setScanning(true);
     setToast(null);
     try {
+      // Collect path renames from encrypt / decrypt responses
+      const renames = new Map();
+
       for (const filepath of paths) {
         const selectedFile = files.find((file) => file.path === filepath);
-        await postRemediation(action, filepath, selectedFile);
+        const response = await postRemediation(action, filepath, selectedFile);
+        const outputFile = response?.data?.output_file;
+        if (outputFile && outputFile !== filepath) {
+          renames.set(filepath, outputFile);
+        }
       }
+
       if (action === 'shred') {
         setRemovedPaths((current) => new Set([...current, ...paths]));
+        clearSelection();
+      } else if (action === 'encrypt' || action === 'decrypt') {
+        // Rename paths in the scan results so treemap reflects .enc / plain extension
+        if (renames.size > 0) {
+          renameScanPaths(renames);
+          // Also remove the old paths from cleaned / removed sets
+          setCleanedPaths((current) => {
+            const next = new Set(current);
+            renames.forEach((newPath, oldPath) => {
+              next.delete(oldPath);
+              next.add(newPath);
+            });
+            return next;
+          });
+        }
+        // Clear selection — nodes will be stale after rename
         clearSelection();
       } else {
         setCleanedPaths((current) => new Set([...current, ...paths]));
         markCleaned(paths);
       }
-      setToast({ type: 'success', message: `${action} completed for ${paths.length} file(s).` });
+
+      const label = action.charAt(0).toUpperCase() + action.slice(1);
+      setToast({ type: 'success', message: `${label} completed for ${paths.length} file(s).` });
       setPendingAction(null);
     } catch (error) {
       setToast({ type: 'error', message: friendlyError(error) });
+      setPendingAction(null);
     } finally {
       setScanning(false);
     }
@@ -243,6 +385,13 @@ function AppContent() {
     const type = file.file_type || '';
     return ['pdf', 'zip', 'archive', 'binary', 'image'].includes(type);
   });
+
+  const ACTIONS = [
+    { id: 'shred',   label: '🗑 Shred',   cls: 'btn-danger',   disabled: false,         title: 'Permanently overwrite and delete the file(s).' },
+    { id: 'encrypt', label: '🔒 Encrypt', cls: 'btn-success',  disabled: false,         title: 'AES-encrypt the file(s) and shred the originals.' },
+    { id: 'decrypt', label: '🔓 Decrypt', cls: 'btn-warning',  disabled: false,         title: 'Decrypt a previously encrypted .enc file.' },
+    { id: 'redact',  label: '✏ Redact',  cls: 'btn-secondary', disabled: redactDisabled, title: redactDisabled ? 'Redaction is available only for text-like files.' : 'Replace detected PII with [REDACTED] in-place.' },
+  ];
 
   return (
     <div className="app-container dark-theme">
@@ -254,12 +403,15 @@ function AppContent() {
             <p>Offline Privacy Audit Tool</p>
           </div>
         </div>
-        <div className="header-actions">
-          <span className={`scan-pulse ${scanning ? 'is-active' : ''}`} aria-hidden="true" />
-          <button type="button" className="btn-primary btn-scan" onClick={handleScan} disabled={scanning}>
-            {scanning ? 'Scanning...' : 'Scan Test Directory'}
-          </button>
-        </div>
+
+        <ScanModeBar
+          scanMode={scanMode}
+          setScanMode={setScanMode}
+          customDir={customDir}
+          setCustomDir={setCustomDir}
+          onScan={handleScan}
+          scanning={scanning}
+        />
       </header>
 
       <main className="dashboard-layout">
@@ -316,33 +468,32 @@ function AppContent() {
                   <strong>{selectedFiles.length}</strong>
                   <span>file{selectedFiles.length === 1 ? '' : 's'} selected</span>
                 </div>
+
                 <div className="remediation-actions">
-                  <button type="button" className="btn-danger" onClick={() => requestRemediation('shred')}>Shred</button>
-                  {selectedFiles.some(file => file.path.endsWith('.enc')) ? (
-                    <button type="button" className="btn-success" onClick={() => requestRemediation('decrypt')}>Decrypt</button>
-                  ) : (
-                    <>
-                      <button type="button" className="btn-secondary" onClick={() => requestRemediation('encrypt')}>Encrypt</button>
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={() => requestRemediation('redact')}
-                        disabled={redactDisabled}
-                        title={redactDisabled ? 'Redaction is available only for text-like files.' : undefined}
-                      >
-                        Redact
-                      </button>
-                    </>
-                  )}
+                  {ACTIONS.map(({ id, label, cls, disabled, title }) => (
+                    <button
+                      key={id}
+                      id={`btn-action-${id}`}
+                      type="button"
+                      className={cls}
+                      disabled={disabled}
+                      title={title}
+                      onClick={() => requestRemediation(id)}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
+
                 <p className="privacy-note">Operations stay local. Do not export backups with passphrases or PII values.</p>
+
                 <div className="selected-file-list">
                   {selectedFiles.slice(0, 20).map((file) => (
                     <article key={file.path} className="selected-file">
                       <strong>{file.name || file.path.split(/[\\/]/).pop()}</strong>
                       <span>{file.path}</span>
                       <span>
-                        {SEVERITY_LABELS[file.severity || 0]} severity - {formatBytes(file.value)}
+                        {SEVERITY_LABELS[file.severity || 0]} severity — {formatBytes(file.value)}
                       </span>
                       <span>PII: {(file.topPiiTypes || file.pii || []).slice(0, 3).join(', ') || 'None detected'}</span>
                       {file.excerpt && <p>{file.excerpt}</p>}
@@ -360,9 +511,16 @@ function AppContent() {
           <div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="panel-confirm-title">
             <h3 id="panel-confirm-title">Confirm {pendingAction.action}</h3>
             <p>
-              Run {pendingAction.action} on {pendingAction.paths.length} file
-              {pendingAction.paths.length === 1 ? '' : 's'}? Dry-run is recommended before destructive remediation.
+              Run <strong>{pendingAction.action}</strong> on{' '}
+              <strong>{pendingAction.paths.length}</strong> file{pendingAction.paths.length === 1 ? '' : 's'}?
+              {pendingAction.action === 'shred' && ' ⚠️ This is irreversible.'}
             </p>
+            <ul className="confirm-file-list">
+              {pendingAction.paths.slice(0, 5).map((p) => (
+                <li key={p}>{p.split(/[\\/]/).pop()}</li>
+              ))}
+              {pendingAction.paths.length > 5 && <li>…and {pendingAction.paths.length - 5} more</li>}
+            </ul>
             <div className="modal-actions">
               <button type="button" className="btn-secondary" onClick={() => setPendingAction(null)}>Cancel</button>
               <button type="button" className="btn-danger" onClick={confirmRemediation}>Confirm</button>
