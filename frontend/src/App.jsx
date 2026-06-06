@@ -10,7 +10,44 @@ import {
   transformScanToTreemapData,
 } from './lib/treemapUtils';
 
-const API_BASE = 'http://127.0.0.1:5001';
+const API_HOST = '127.0.0.1';
+const API_PORTS = Array.from({ length: 11 }, (_, index) => 5000 + index);
+const API_BASE = `http://${API_HOST}:5000`;
+let cachedApiBase = null;
+
+async function resolveApiBase() {
+  const storedBase = typeof window !== 'undefined'
+    ? window.localStorage.getItem('privacylens_api_base')
+    : null;
+  const candidates = [...new Set([
+    cachedApiBase,
+    storedBase,
+    ...API_PORTS.map((port) => `http://${API_HOST}:${port}`),
+  ].filter(Boolean))];
+
+  for (const base of candidates) {
+    try {
+      const response = await axios.get(`${base}/health`, { timeout: 750 });
+      if (response.data?.status === 'ok') {
+        cachedApiBase = base;
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem('privacylens_api_base', base);
+        }
+        return base;
+      }
+    } catch {
+      // Try the next local port.
+    }
+  }
+
+  return API_BASE;
+}
+
+async function apiPost(path, payload) {
+  const base = await resolveApiBase();
+  return axios.post(`${base}${path}`, payload);
+}
+
 const DEFAULT_SCAN_DIR =
   (typeof process !== 'undefined' && process.env?.REACT_APP_TEST_DIR) ||
   '~/privacylens_test_data';
@@ -47,18 +84,18 @@ const SAMPLE_SCAN = {
 
 async function postRemediation(action, filepath, selectedFile) {
   if (action === 'shred') {
-    return axios.post(`${API_BASE}/remediate/shred`, { filepath });
+    return apiPost('/remediate/shred', { filepath });
   }
   if (action === 'encrypt') {
     const password = window.prompt('Enter a local encryption passphrase. It is sent only to 127.0.0.1.');
     if (!password) throw new Error('Encryption cancelled: passphrase is required.');
-    return axios.post(`${API_BASE}/remediate/encrypt`, { filepath, password });
+    return apiPost('/remediate/encrypt', { filepath, password });
   }
   const piiList = (selectedFile?.pii || selectedFile?.topPiiTypes || []).map((type) => ({
     pii_type: type,
     value: selectedFile?.excerpt || type,
   }));
-  return axios.post(`${API_BASE}/remediate/redact`, { filepath, pii_list: piiList });
+  return apiPost('/remediate/redact', { filepath, pii_list: piiList });
 }
 
 function friendlyError(error) {
@@ -67,7 +104,7 @@ function friendlyError(error) {
     return `${detail}. The file may be locked by OneDrive or another app; close it and retry.`;
   }
   if (/network|failed|ECONNREFUSED/i.test(detail)) {
-    return 'Backend is offline. Start the backend on http://127.0.0.1:5001 and retry.';
+    return 'Backend is offline. Start the backend locally on ports 5000-5010 and retry.';
   }
   return detail;
 }
@@ -130,7 +167,7 @@ function AppContent() {
     setToast(null);
     setLastQuery(DEFAULT_SCAN_DIR);
     try {
-      const response = await axios.post(`${API_BASE}/scan`, { directory: DEFAULT_SCAN_DIR });
+      const response = await apiPost('/scan', { directory: DEFAULT_SCAN_DIR });
       setScanResults(response.data);
       setRemovedPaths(new Set());
       setCleanedPaths(new Set());

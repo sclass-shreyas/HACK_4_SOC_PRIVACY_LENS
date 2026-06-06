@@ -1,9 +1,13 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Any, List, Optional
+import json
 import logging
 import os
+import socket
+import tempfile
 
 from app.crawler import FileCrawler
 from app.ledger import EncryptedLedger, InvalidLedgerKeyError, LedgerQueryError
@@ -75,6 +79,15 @@ class LedgerRotateKeyRequest(BaseModel):
 class LedgerCloseRequest(BaseModel):
     db_path: str | None = None
 
+
+class LedgerHistoryRequest(BaseModel):
+    db_path: str
+    passphrase: str
+    type: str | None = None
+    source: str | None = None
+    limit: int = 100
+    offset: int = 0
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -86,6 +99,10 @@ class ScanRequest(BaseModel):
     max_depth: int = 5
     max_files: int = 5000
     max_file_size_mb: int = 25
+
+
+class ChatParseRequest(BaseModel):
+    filepath: str
 
 
 def _ledger_http_error(exc: Exception) -> HTTPException:
@@ -153,6 +170,94 @@ async def scan_filesystem(request: ScanRequest):
         results = crawler.scan_many(directories)
 
     return results
+
+@app.post("/scan/stream")
+async def scan_filesystem_stream(request: ScanRequest):
+    """
+    Stream scan progress as newline-delimited JSON events.
+    """
+    crawler = FileCrawler(
+        max_depth=request.max_depth,
+        max_files=request.max_files,
+        max_file_size_mb=request.max_file_size_mb
+    )
+
+    if request.directories:
+        directories = [os.path.expanduser(directory) for directory in request.directories]
+    elif request.directory:
+        directories = [os.path.expanduser(request.directory)]
+    else:
+        directories = [directory for directory in crawler.default_scan_paths() if os.path.isdir(directory)]
+
+    missing = [directory for directory in directories if not os.path.isdir(directory)]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Directory not found: {missing[0]}")
+
+    def event_stream():
+        total_files_seen = 0
+        for directory in directories:
+            remaining_files = request.max_files - total_files_seen
+            if remaining_files <= 0:
+                break
+
+            directory_crawler = FileCrawler(
+                max_depth=request.max_depth,
+                max_files=remaining_files,
+                max_file_size_mb=request.max_file_size_mb
+            )
+            for event in directory_crawler.scan_iter(directory):
+                if event.get('event') == 'complete':
+                    total_files_seen += event.get('stats', {}).get('total_files', 0)
+                yield json.dumps(event, default=str) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.post("/parse/chat")
+async def parse_chat_log(request: ChatParseRequest):
+    """
+    Parse a WhatsApp/Telegram export file into searchable content and metadata.
+    """
+    filepath = os.path.expanduser(request.filepath)
+    if not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail=f"File not found: {filepath}")
+
+    crawler = FileCrawler(max_files=1)
+    parsed = crawler._extract_chat_text(filepath)
+    return {
+        "path": filepath,
+        "file_type": "chat_log",
+        "content": parsed["content"],
+        "metadata": parsed["metadata"],
+    }
+
+
+@app.post("/parse/chat/upload")
+async def upload_chat_log(file: UploadFile = File(...)):
+    """
+    Parse an uploaded WhatsApp/Telegram export without storing it permanently.
+    """
+    suffix = os.path.splitext(file.filename or "")[1] or ".txt"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_path = tmp_file.name
+            tmp_file.write(await file.read())
+
+        crawler = FileCrawler(max_files=1)
+        parsed = crawler._extract_chat_text(tmp_path)
+        return {
+            "filename": file.filename,
+            "file_type": "chat_log",
+            "content": parsed["content"],
+            "metadata": parsed["metadata"],
+        }
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 @app.post("/classify")
 async def classify_pii(text: str):
@@ -276,6 +381,32 @@ async def ledger_query(request: LedgerQueryRequest):
         raise _ledger_http_error(exc)
 
 
+@app.post("/history")
+async def ledger_history(request: LedgerHistoryRequest):
+    logger.info("Ledger history request")
+    try:
+        clauses = []
+        params: list[Any] = []
+        if request.type:
+            clauses.append("type = ?")
+            params.append(request.type)
+        if request.source:
+            clauses.append("source = ?")
+            params.append(request.source)
+
+        with EncryptedLedger(request.db_path, request.passphrase) as ledger:
+            rows = ledger.query_entries(
+                " AND ".join(clauses) if clauses else None,
+                tuple(params),
+                limit=request.limit,
+                offset=request.offset,
+            )
+        return {"status": "ok", "rows": rows}
+    except Exception as exc:
+        logger.error("Ledger history failed")
+        raise _ledger_http_error(exc)
+
+
 @app.post("/ledger/backup")
 async def ledger_backup(request: LedgerBackupRequest):
     logger.info("Ledger backup request")
@@ -311,4 +442,20 @@ async def ledger_close(request: LedgerCloseRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=5001)
+
+    def find_available_port(start_port: int = 5000, attempts: int = 11) -> int:
+        for port in range(start_port, start_port + attempts):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(("127.0.0.1", port))
+                    return port
+                except OSError:
+                    continue
+        raise RuntimeError(f"No available backend port in range {start_port}-{start_port + attempts - 1}")
+
+    requested_port = int(os.getenv("PRIVACYLENS_PORT", "5000"))
+    port = find_available_port(requested_port)
+    if port != requested_port:
+        logger.warning("Port %s is unavailable; starting backend on %s", requested_port, port)
+    uvicorn.run(app, host="127.0.0.1", port=port)
