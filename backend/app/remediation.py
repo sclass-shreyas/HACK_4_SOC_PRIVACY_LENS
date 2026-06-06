@@ -118,3 +118,43 @@ def redact_file(
         },
     )
     return {"status": "redacted", "replacements": replacements, "file": filepath}
+
+
+def decrypt_file(
+    filepath: str,
+    password: str,
+    ledger_db_path: str | None = None,
+    ledger_passphrase: str | None = None,
+) -> dict:
+    if not os.path.exists(filepath):
+        raise ValueError(f"File not found: {filepath}")
+
+    if not filepath.endswith(".enc"):
+        raise ValueError("File is not an encrypted (.enc) file")
+
+    output_file = filepath[:-4]
+    key = _derive_key(password)
+    fernet = Fernet(key)
+
+    with open(filepath, "rb") as f:
+        encrypted = f.read()
+
+    try:
+        plaintext = fernet.decrypt(encrypted)
+    except Exception:
+        raise ValueError("Invalid password or corrupted file")
+
+    with open(output_file, "wb") as f:
+        f.write(plaintext)
+
+    os.remove(filepath)
+
+    _ledger_insert(
+        ledger_db_path,
+        ledger_passphrase,
+        "remediation.decrypt",
+        "remediation.decrypt_file",
+        {"file": output_file, "encrypted_file": filepath},
+    )
+    return {"status": "decrypted", "output_file": output_file}
+

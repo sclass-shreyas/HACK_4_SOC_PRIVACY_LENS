@@ -91,10 +91,24 @@ async function postRemediation(action, filepath, selectedFile) {
     if (!password) throw new Error('Encryption cancelled: passphrase is required.');
     return apiPost('/remediate/encrypt', { filepath, password });
   }
-  const piiList = (selectedFile?.pii || selectedFile?.topPiiTypes || []).map((type) => ({
-    pii_type: type,
-    value: selectedFile?.excerpt || type,
-  }));
+  if (action === 'decrypt') {
+    const password = window.prompt('Enter the decryption passphrase.');
+    if (!password) throw new Error('Decryption cancelled: passphrase is required.');
+    return apiPost('/remediate/decrypt', { filepath, password });
+  }
+  const listToUse = selectedFile?.detections || selectedFile?.pii || selectedFile?.topPiiTypes || [];
+  const piiList = listToUse.map((item) => {
+    if (typeof item === 'object' && item !== null) {
+      return {
+        pii_type: item.pii_type || item.piiType || 'unknown',
+        value: item.value || item.excerpt || '',
+      };
+    }
+    return {
+      pii_type: item,
+      value: selectedFile?.excerpt || item,
+    };
+  });
   return apiPost('/remediate/redact', { filepath, pii_list: piiList });
 }
 
@@ -304,16 +318,22 @@ function AppContent() {
                 </div>
                 <div className="remediation-actions">
                   <button type="button" className="btn-danger" onClick={() => requestRemediation('shred')}>Shred</button>
-                  <button type="button" className="btn-secondary" onClick={() => requestRemediation('encrypt')}>Encrypt</button>
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    onClick={() => requestRemediation('redact')}
-                    disabled={redactDisabled}
-                    title={redactDisabled ? 'Redaction is available only for text-like files.' : undefined}
-                  >
-                    Redact
-                  </button>
+                  {selectedFiles.some(file => file.path.endsWith('.enc')) ? (
+                    <button type="button" className="btn-success" onClick={() => requestRemediation('decrypt')}>Decrypt</button>
+                  ) : (
+                    <>
+                      <button type="button" className="btn-secondary" onClick={() => requestRemediation('encrypt')}>Encrypt</button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => requestRemediation('redact')}
+                        disabled={redactDisabled}
+                        title={redactDisabled ? 'Redaction is available only for text-like files.' : undefined}
+                      >
+                        Redact
+                      </button>
+                    </>
+                  )}
                 </div>
                 <p className="privacy-note">Operations stay local. Do not export backups with passphrases or PII values.</p>
                 <div className="selected-file-list">

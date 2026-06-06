@@ -11,7 +11,7 @@ import tempfile
 
 from app.crawler import FileCrawler
 from app.ledger import EncryptedLedger, InvalidLedgerKeyError, LedgerQueryError
-from app.remediation import secure_delete, encrypt_file, redact_file
+from app.remediation import secure_delete, encrypt_file, redact_file, decrypt_file
 
 
 class ShredRequest(BaseModel):
@@ -21,6 +21,13 @@ class ShredRequest(BaseModel):
 
 
 class EncryptRequest(BaseModel):
+    filepath: str
+    password: str
+    ledger_db_path: str | None = None
+    ledger_passphrase: str | None = None
+
+
+class DecryptRequest(BaseModel):
     filepath: str
     password: str
     ledger_db_path: str | None = None
@@ -308,6 +315,23 @@ async def encrypt_file_endpoint(request: EncryptRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Encrypt failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/remediate/decrypt")
+async def decrypt_file_endpoint(request: DecryptRequest):
+    """Decrypt an AES-encrypted (.enc) file back to its original name."""
+    try:
+        result = decrypt_file(
+            request.filepath,
+            request.password,
+            ledger_db_path=request.ledger_db_path,
+            ledger_passphrase=request.ledger_passphrase,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Decrypt failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/remediate/redact")
