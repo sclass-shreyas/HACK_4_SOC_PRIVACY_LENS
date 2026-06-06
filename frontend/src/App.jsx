@@ -256,7 +256,7 @@ function AppContent() {
   });
 
   return (
-    <div className="app-container">
+    <div className="app-container light-app">
       <header className="app-header">
         <div className="brand-lockup">
           <div className="brand-icon" aria-hidden="true">
@@ -324,8 +324,8 @@ function AppContent() {
         <section className={`score-band score-${scoreTone}`} aria-label="Privacy score summary">
           <div className="score-orb" style={{ '--score': privacyScore }}>
             <div className="score-ring">
-              <strong>{privacyScore}</strong>
-              <span>out of 100</span>
+              <strong className="score-number">{privacyScore}</strong>
+              <span className="score-label">/ 100</span>
             </div>
           </div>
 
