@@ -1,0 +1,91 @@
+/* frontend/src/styles/fileGrid.css */
+.file-grid-wrapper {
+  padding: 18px;
+  background: linear-gradient(180deg, #071124 0%, #071428 100%);
+  color: #e6eef6;
+  border-radius: 8px;
+}
+.file-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+}
+.file-card {
+  background: #0f2738;
+  border-radius: 10px;
+  padding: 12px;
+  box-shadow: 0 6px 18px rgba(2,10,18,0.6);
+  transition: transform .16s ease, box-shadow .16s ease;
+  display: flex;
+  flex-direction: column;
+  min-height: 110px;
+  border: 1px solid rgba(255,255,255,0.03);
+}
+.file-card:hover {
+  transform: translateY(-6px);
+  box-shadow: 0 14px 30px rgba(2,10,18,0.7);
+}
+.file-card-header {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:8px;
+}
+.file-title {
+  font-weight:600;
+  color:#f6fbff;
+  font-size:14px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  max-width:70%;
+}
+.file-chip {
+  background: rgba(255,255,255,0.06);
+  padding:4px 8px;
+  border-radius:999px;
+  font-size:12px;
+  color:#dcebf7;
+}
+.file-body { flex:1; display:flex; flex-direction:column; justify-content:center; gap:6px;}
+.file-size { font-weight:700; color:#cfe9ff; }
+.file-meta { font-size:12px; color:#9fb9d0; }
+.file-pii { font-size:12px; color:#bcd6e8; margin-top:6px; }
+.file-footer { font-size:12px; color:#8aa6bf; margin-top:8px; display:flex; gap:8px; justify-content:flex-end; }
+
+.btn-ghost.small {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.04);
+  color: #dcebf7;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.btn-ghost.small.btn-danger { background: rgba(226,75,90,0.12); border-color: rgba(226,75,90,0.18); }
+
+.file-legend {
+  margin-top: 14px;
+  display:flex;
+  gap:12px;
+  align-items:center;
+  color:#a9c0d4;
+}
+.legend-item { margin-right:12px; display:inline-flex; align-items:center; font-size:13px; color:#a9c0d4;}
+.legend-swatch { width:14px; height:14px; display:inline-block; border-radius:3px; margin-right:6px; border:1px solid rgba(255,255,255,0.06); }
+.legend-swatch.info { background:#9fbfe8; }
+.legend-swatch.low  { background:#7fd3a6; }
+.legend-swatch.medium { background:#ffbd59; }
+.legend-swatch.high { background:#e24b5a; }
+
+/* risk level card coloring */
+.file-card.risk-info { border-left: 4px solid #9fbfe8; }
+.file-card.risk-low  { border-left: 4px solid #7fd3a6; }
+.file-card.risk-medium { border-left: 4px solid #ffbd59; }
+.file-card.risk-high { border-left: 4px solid #e24b5a; }
+
+/* Responsive tweaks */
+@media (max-width:640px) {
+  .file-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap:10px; }
+  .file-title { font-size:13px; }
+}
