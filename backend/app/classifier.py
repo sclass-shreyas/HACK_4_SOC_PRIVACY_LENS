@@ -298,6 +298,28 @@ class PIIClassifier:
             return line_has_financial_csv_shape
         if pii_type == "Phone":
             return line_has_financial_csv_shape and text[match.start() - 1:match.start()] != "+"
+        # Additional heuristics to reduce false positives in rule/config files
+        stripped = line.strip()
+        # Skip adblock/filter comment lines or rule syntax (many filter lists use '!' and '##')
+        if stripped.startswith("!") or "##" in line or "#$" in line:
+            return True
+
+        low = line.lower()
+        # Skip lines that clearly look like URLs, domains or contain many dots
+        if "http" in low or "www." in low or line.count(".") >= 2:
+            return True
+
+        # Skip lines that are punctuation-heavy (selectors, CSS rules, patterns)
+        punct_count = sum(1 for c in line if not c.isalnum() and not c.isspace())
+        if punct_count >= 6:
+            return True
+
+        # Skip lines that are mostly digits (large numeric dumps) with few letters
+        digits = sum(1 for c in line if c.isdigit())
+        letters = sum(1 for c in line if c.isalpha())
+        if digits > 0 and letters == 0 and digits / max(1, len(line)) > 0.5:
+            return True
+
         return False
 
 
