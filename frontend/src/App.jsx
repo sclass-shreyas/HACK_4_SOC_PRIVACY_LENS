@@ -8,6 +8,7 @@ import {
   formatBytes,
   SEVERITY_LABELS,
   transformScanToTreemapData,
+  transformScanToDirectoryTree,
 } from './lib/treemapUtils';
 
 const API_HOST = '127.0.0.1';
@@ -202,7 +203,7 @@ function ScanModeBar({ scanMode, setScanMode, customDir, setCustomDir, onScan, s
 
 function AppContent() {
   const [scanResults, setScanResults] = useState(SAMPLE_SCAN);
-  const [aggregateBy, setAggregateBy] = useState('category');
+  const [aggregateBy, setAggregateBy] = useState('directory');
   const [scanning, setScanning] = useState(false);
   const [toast, setToast] = useState(null);
   const [pendingAction, setPendingAction] = useState(null);
@@ -213,7 +214,9 @@ function AppContent() {
   const { selectedNodes, clearSelection, markCleaned, setLastQuery } = useTreemapStore();
 
   const treeData = useMemo(() => {
-    const transformed = transformScanToTreemapData(scanResults, { aggregateBy, topN: 3000 });
+    const transformed = aggregateBy === 'directory'
+      ? transformScanToDirectoryTree(scanResults)
+      : transformScanToTreemapData(scanResults, { aggregateBy, topN: 3000 });
 
     function markNode(node) {
       const paths = collectFilePaths(node);
@@ -436,11 +439,12 @@ function AppContent() {
 
           <div className="score-controls">
             <label>
-              Aggregate
+              View Style
               <select value={aggregateBy} onChange={(event) => setAggregateBy(event.target.value)}>
-                <option value="category">Category</option>
-                <option value="type">File type</option>
-                <option value="file">File</option>
+                <option value="directory">📁 Directory Structure</option>
+                <option value="category">🏷️ Privacy Category</option>
+                <option value="type">🛠️ File Type</option>
+                <option value="file">📄 Flat File List</option>
               </select>
             </label>
           </div>

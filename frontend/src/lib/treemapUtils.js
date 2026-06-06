@@ -163,6 +163,150 @@ function collapseToTopN(files, topN) {
   ];
 }
 
+function collapseGroupFiles(files, groupName, maxVisible = 12) {
+  if (files.length <= maxVisible) {
+    return files.map((file) => ({
+      ...file,
+      files: [file],
+    }));
+  }
+
+  const sorted = [...files].sort((a, b) => b.value - a.value);
+  const keep = sorted.slice(0, maxVisible - 1);
+  const others = sorted.slice(maxVisible - 1);
+
+  const othersValue = others.reduce((sum, f) => sum + f.value, 0);
+  const othersSeverity = Math.max(...others.map((f) => f.severity), 0);
+  const othersPii = [...new Set(others.flatMap((f) => f.pii || []))];
+
+  const othersNode = {
+    id: stableId(`others-${groupName}-${others.length}-${othersValue}`),
+    name: `+${others.length} other files`,
+    path: `${others.length} other files`,
+    value: othersValue,
+    severity: othersSeverity,
+    pii: othersPii,
+    topPiiTypes: othersPii.slice(0, 3),
+    excerpt: `Contains ${others.length} smaller files in the ${groupName} category.`,
+    category: groupName,
+    file_type: 'aggregate',
+    files: others,
+  };
+
+  return [
+    ...keep.map((file) => ({
+      ...file,
+      files: [file],
+    })),
+    othersNode,
+  ];
+}
+
+function getCommonPrefix(paths) {
+  if (!paths.length) return '';
+  const first = paths[0].split(/[\\/]/);
+  let common = first;
+
+  for (let index = 1; index < paths.length; index++) {
+    const parts = paths[index].split(/[\\/]/);
+    let tempCommon = [];
+    for (let j = 0; j < Math.min(common.length, parts.length); j++) {
+      if (common[j] === parts[j]) {
+        tempCommon.push(common[j]);
+      } else {
+        break;
+      }
+    }
+    common = tempCommon;
+  }
+  if (common.length > 0 && common[common.length - 1].includes('.')) {
+    common.pop();
+  }
+  return common.join('/');
+}
+
+export function transformScanToDirectoryTree(scanResults) {
+  const rawFiles = Array.isArray(scanResults) ? scanResults : (scanResults?.files || scanResults?.results || []);
+  const normalizedFiles = rawFiles.filter(Boolean).map(normalizeScanFile);
+
+  const paths = normalizedFiles.map((f) => f.path).filter(Boolean);
+  const commonPrefix = getCommonPrefix(paths);
+
+  const root = {
+    id: 'root',
+    name: 'root',
+    path: '',
+    isDirectory: true,
+    children: {},
+    files: [],
+  };
+
+  normalizedFiles.forEach((file) => {
+    let relativePath = file.path;
+    if (commonPrefix && relativePath.startsWith(commonPrefix)) {
+      relativePath = relativePath.slice(commonPrefix.length).replace(/^[\\/]/, '');
+    }
+    const parts = relativePath.split(/[\\/]/).filter(Boolean);
+    let current = root;
+
+    for (let index = 0; index < parts.length - 1; index++) {
+      const part = parts[index];
+      if (!current.children[part]) {
+        current.children[part] = {
+          id: stableId(`dir:${current.path ? current.path + '/' : ''}${part}`),
+          name: part,
+          path: current.path ? `${current.path}/${part}` : part,
+          isDirectory: true,
+          children: {},
+          files: [],
+        };
+      }
+      current = current.children[part];
+    }
+
+    const name = parts[parts.length - 1] || file.name || file.path;
+    current.files.push({
+      ...file,
+      name,
+      isDirectory: false,
+    });
+  });
+
+  function finalize(node) {
+    const childList = Object.values(node.children).map(finalize);
+    node.children = childList.sort((a, b) => a.name.localeCompare(b.name));
+
+    node.files = node.files.sort((a, b) => a.name.localeCompare(b.name));
+
+    const localFiles = [...node.files];
+    const allFiles = [
+      ...localFiles,
+      ...childList.flatMap((c) => c.files),
+    ];
+
+    node.localFiles = localFiles;
+    node.files = allFiles;
+    node.value = allFiles.reduce((sum, f) => sum + f.value, 0);
+    node.severity = allFiles.reduce((max, f) => Math.max(max, f.severity), 0);
+
+    return node;
+  }
+
+  const finalizedRoot = finalize(root);
+
+  return {
+    name: commonPrefix || 'root',
+    id: 'root',
+    value: finalizedRoot.value,
+    severity: finalizedRoot.severity,
+    files: normalizedFiles,
+    children: finalizedRoot.children,
+    localFiles: finalizedRoot.localFiles,
+    stats: scanResults?.stats || {},
+    isDirectory: true,
+  };
+}
+
 export function transformScanToTreemapData(scanResults, options = {}) {
   const { aggregateBy = 'category', topN = 3000 } = options;
   const rawFiles = Array.isArray(scanResults) ? scanResults : (scanResults?.files || scanResults?.results || []);
@@ -176,10 +320,7 @@ export function transformScanToTreemapData(scanResults, options = {}) {
     value: files.reduce((sum, file) => sum + file.value, 0),
     severity: Math.max(...files.map((file) => file.severity), 0),
     files,
-    children: files.map((file) => ({
-      ...file,
-      files: [file],
-    })),
+    children: collapseGroupFiles(files, groupName, 12),
   })).sort((a, b) => b.value - a.value);
 
   return {

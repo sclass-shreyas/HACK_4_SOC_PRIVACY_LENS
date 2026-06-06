@@ -62,12 +62,24 @@ class FileCrawler:
         self.max_files = max_files
         self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
         self.files_found = []
+        self.processed_paths = set()
 
     @classmethod
     def default_scan_paths(cls) -> List[str]:
         """Return existing default paths for the current platform."""
         platform_paths = cls.SCAN_PATHS.get(sys.platform, cls.SCAN_PATHS.get('linux', []))
         expanded_paths = [os.path.expanduser(path) for path in platform_paths]
+
+        # On Windows, also find all active drives (starting from C:) and include them
+        if sys.platform == 'win32':
+            import string
+            drives = []
+            for letter in string.ascii_uppercase[2:]:  # Start from 'C' to 'Z'
+                drive_path = f"{letter}:\\"
+                if os.path.exists(drive_path):
+                    drives.append(drive_path)
+            expanded_paths = drives + expanded_paths
+
         return list(dict.fromkeys(expanded_paths))
 
     def scan_defaults(self) -> Dict:
@@ -239,6 +251,11 @@ class FileCrawler:
 
     def _process_file(self, filepath: str, stats: Dict) -> Optional[Dict]:
         """Process a single file and extract text content."""
+        norm_path = os.path.abspath(filepath)
+        if norm_path in self.processed_paths:
+            return None
+        self.processed_paths.add(norm_path)
+
         stats['total_files'] += 1
         
         ext = os.path.splitext(filepath)[1].lower()
