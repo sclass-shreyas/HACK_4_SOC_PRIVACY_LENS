@@ -44,7 +44,63 @@ class FileCrawler:
         'tax*.pdf', 'health*.pdf', 'medical*.pdf', '*credentials*',
         '*password*', '*account*'
     ]
-    
+
+    # Hidden directories known to contain PII or credentials.
+    # These are excluded by the default scan (which skips hidden dirs)
+    # but included in full system scan mode.
+    HIDDEN_PII_PATHS = {
+        'linux': [
+            '~/.ssh',
+            '~/.aws',
+            '~/.config',
+            '~/.local/share',
+            '~/.gnupg',
+            '~/.netrc',
+            '~/.bashrc',
+            '~/.bash_history',
+            '~/.zshrc',
+            '~/.zsh_history',
+            '~/.profile',
+            '~/.env',
+            '~/.docker/config.json',
+        ],
+        'darwin': [
+            '~/.ssh',
+            '~/.aws',
+            '~/.config',
+            '~/.local/share',
+            '~/.gnupg',
+            '~/.netrc',
+            '~/.bashrc',
+            '~/.zshrc',
+            '~/.zsh_history',
+            '~/.profile',
+            '~/.env',
+            '~/.docker/config.json',
+            '~/Library/Keychains',
+            '~/Library/Application Support/Code/User',  # VS Code settings
+        ],
+        'win32': [
+            '~/AppData/Roaming',
+            '~/AppData/Local/Temp',
+            '~/AppData/Local/Microsoft/Credentials',
+            '~/.ssh',
+            '~/.aws',
+            '~/.config',
+            '~/.docker/config.json',
+            '~/.gitconfig',
+            '~/NTUSER.DAT',
+        ],
+    }
+
+    # Dirs skipped even in full scan mode (too large, not PII-relevant)
+    FULL_SCAN_SKIP_DIRS = {
+        '.git', 'node_modules', '__pycache__', 'venv', '.venv',
+        'env', '.env', 'dist', 'build', '.next', '.nuxt',
+        'vendor', 'bower_components', '.cache', '.npm', '.yarn',
+        'site-packages', 'Lib', 'lib',
+    }
+
     SKIPPED_EXTENSIONS = {
         '.exe', '.dll', '.so', '.bin', '.iso', '.dmg',
         '.zip', '.tar', '.gz', '.rar',
@@ -70,11 +126,50 @@ class FileCrawler:
         expanded_paths = [os.path.expanduser(path) for path in platform_paths]
         return list(dict.fromkeys(expanded_paths))
 
+    @classmethod
+    def full_system_scan_paths(cls) -> List[str]:
+        """
+        Returns the union of default scan paths + hidden PII paths for this platform.
+        Expands ~ and deduplicates. Non-existent paths are silently excluded.
+        """
+        platform_key = sys.platform if sys.platform in cls.SCAN_PATHS else 'linux'
+        default = cls.SCAN_PATHS.get(platform_key, [])
+        hidden = cls.HIDDEN_PII_PATHS.get(platform_key, [])
+        all_paths = default + hidden
+        expanded = [os.path.expanduser(p) for p in all_paths]
+        # Deduplicate and only return paths that exist
+        seen = set()
+        result = []
+        for path in expanded:
+            if path not in seen and os.path.exists(path):
+                seen.add(path)
+                result.append(path)
+        return result
+
     def scan_defaults(self) -> Dict:
         """Scan all existing default paths for the current platform."""
         return self.scan_many(self.default_scan_paths())
 
-    def scan_many(self, directories: List[str]) -> Dict:
+    def scan_full_system(self) -> Dict:
+        """
+        Performs a deep scan: default paths + hidden PII directories.
+        Hidden dirs (starting with '.') are NOT skipped in this mode.
+        Large junk dirs (node_modules, .git etc.) are still skipped.
+        max_depth is raised to 8, max_files to 20000 for this call.
+        """
+        original_depth = self.max_depth
+        original_max = self.max_files
+        self.max_depth = 8
+        self.max_files = 20000
+        try:
+            paths = self.full_system_scan_paths()
+            logger.info(f"Full system scan: {len(paths)} paths — {paths}")
+            return self.scan_many(paths, include_hidden=True)
+        finally:
+            self.max_depth = original_depth
+            self.max_files = original_max
+
+    def scan_many(self, directories: List[str], include_hidden: bool = False) -> Dict:
         """Scan several directories and merge their crawl results."""
         original_max_files = self.max_files
         merged = {
@@ -87,6 +182,7 @@ class FileCrawler:
                 'csvs': 0,
                 'dbs': 0,
                 'chats': 0,
+                'dotfiles': 0,
                 'skipped_large_files': 0,
                 'permission_errors': 0,
                 'paths_scanned': 0
@@ -100,7 +196,7 @@ class FileCrawler:
                     break
 
                 self.max_files = remaining_files
-                results = self.scan(directory)
+                results = self.scan(directory, include_hidden=include_hidden)
                 merged['files'].extend(results['files'])
                 merged['errors'].extend(results['errors'])
                 for key, value in results['stats'].items():
@@ -110,7 +206,7 @@ class FileCrawler:
 
         return merged
 
-    def scan_iter(self, directory: str) -> Generator[Dict[str, Any], None, None]:
+    def scan_iter(self, directory: str, include_hidden: bool = False) -> Generator[Dict[str, Any], None, None]:
         """Yield scan progress events as files are processed."""
         logger.info(f"Starting streaming crawl of: {directory}")
         results = self._empty_results()
@@ -133,7 +229,11 @@ class FileCrawler:
                 results.setdefault('_pending_events', []).append(yield_event)
 
             for root, dirs, files in os.walk(directory, onerror=on_walk_error):
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                dirs[:] = [
+                    d for d in dirs
+                    if (include_hidden or not d.startswith('.'))
+                    and d not in self.FULL_SCAN_SKIP_DIRS
+                ]
 
                 for pending in results.pop('_pending_events', []):
                     yield pending
@@ -179,7 +279,7 @@ class FileCrawler:
 
         yield {'event': 'complete', 'files': results['files'], 'errors': results['errors'], 'stats': results['stats']}
 
-    def scan(self, directory: str) -> Dict:
+    def scan(self, directory: str, include_hidden: bool = False) -> Dict:
         """
         Scan a directory and extract text from files.
         Returns: {files: [...], errors: [...], stats: {...}}
@@ -201,8 +301,12 @@ class FileCrawler:
                     results['stats']['permission_errors'] += 1
 
             for root, dirs, files in os.walk(directory, onerror=on_walk_error):
-                # Skip hidden directories
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                # Skip hidden directories (unless include_hidden is True) and junk dirs
+                dirs[:] = [
+                    d for d in dirs
+                    if (include_hidden or not d.startswith('.'))
+                    and d not in self.FULL_SCAN_SKIP_DIRS
+                ]
                 
                 depth = len(Path(root).relative_to(directory).parts)
                 if depth > self.max_depth:
@@ -283,6 +387,18 @@ class FileCrawler:
                 file_info['content'] = self._extract_plaintext(filepath)
                 stats['text_files'] += 1
             else:
+                # Dotfiles and extensionless config files known to contain credentials
+                filename = os.path.basename(filepath)
+                if filename in {
+                    '.bashrc', '.zshrc', '.bash_history', '.zsh_history',
+                    '.profile', '.netrc', '.gitconfig', '.env',
+                    'credentials',  # ~/.aws/credentials
+                } or (filename.startswith('.') and ext == ''):
+                    file_info['content'] = self._extract_plaintext(filepath)
+                    file_info['file_type'] = 'dotfile'
+                    stats['text_files'] += 1
+                    stats['dotfiles'] = stats.get('dotfiles', 0) + 1
+                    return file_info if file_info['content'] else None
                 return None  # Unsupported file type
 
         except Exception as e:
@@ -537,6 +653,7 @@ class FileCrawler:
                 'csvs': 0,
                 'dbs': 0,
                 'chats': 0,
+                'dotfiles': 0,
                 'skipped_large_files': 0,
                 'permission_errors': 0,
                 'paths_scanned': 0

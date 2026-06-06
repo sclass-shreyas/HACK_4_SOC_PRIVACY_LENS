@@ -10,6 +10,7 @@ import socket
 import tempfile
 
 from app.crawler import FileCrawler
+from app.classifier import PIIClassifier
 from app.ledger import EncryptedLedger, InvalidLedgerKeyError, LedgerQueryError
 from app.remediation import secure_delete, encrypt_file, redact_file
 
@@ -211,6 +212,29 @@ async def scan_filesystem_stream(request: ScanRequest):
                 yield json.dumps(event, default=str) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.post("/scan/full")
+async def scan_full_system():
+    """
+    Deep scan: default paths + hidden PII directories (~/.ssh, ~/.aws, ~/.config etc.)
+    No request body needed — paths are determined by the server's platform.
+    """
+    try:
+        crawler = FileCrawler(max_depth=8, max_files=20000, max_file_size_mb=25)
+        results = crawler.scan_full_system()
+        # Run classifier on each file (same as /scan endpoint)
+        classifier = PIIClassifier()
+        for file_entry in results.get('files', []):
+            content = file_entry.get('content', '')
+            if content:
+                classification = classifier.classify(content)
+                file_entry['classification'] = classification
+                file_entry['pii_types'] = classification.get('pii_types', [])
+        return results
+    except Exception as e:
+        logger.error(f"/scan/full error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/parse/chat")

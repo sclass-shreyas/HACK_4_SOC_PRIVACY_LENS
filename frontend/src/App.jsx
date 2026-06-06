@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import './App.css';
 import TreemapDashboard from './components/TreemapDashboard';
@@ -109,6 +109,8 @@ function friendlyError(error) {
   return detail;
 }
 
+const LIGHT_SEVERITY_COLORS = ['#d1fae5', '#fef3c7', '#fed7aa', '#fecaca'];
+
 function AppContent() {
   const [scanResults, setScanResults] = useState(SAMPLE_SCAN);
   const [aggregateBy, setAggregateBy] = useState('category');
@@ -117,7 +119,22 @@ function AppContent() {
   const [pendingAction, setPendingAction] = useState(null);
   const [removedPaths, setRemovedPaths] = useState(new Set());
   const [cleanedPaths, setCleanedPaths] = useState(new Set());
+  const [scanMode, setScanMode] = useState('directory'); // 'directory' | 'fullsystem'
+  const [scanDropdownOpen, setScanDropdownOpen] = useState(false);
   const { selectedNodes, clearSelection, markCleaned, setLastQuery } = useTreemapStore();
+
+  const splitBtnRef = useRef(null);
+
+  // Close dropdown when clicking outside the split button
+  useEffect(() => {
+    function handleDocClick(event) {
+      if (splitBtnRef.current && !splitBtnRef.current.contains(event.target)) {
+        setScanDropdownOpen(false);
+      }
+    }
+    document.addEventListener('click', handleDocClick);
+    return () => document.removeEventListener('click', handleDocClick);
+  }, []);
 
   const treeData = useMemo(() => {
     const transformed = transformScanToTreemapData(scanResults, { aggregateBy, topN: 3000 });
@@ -178,14 +195,22 @@ function AppContent() {
   const handleScan = async () => {
     setScanning(true);
     setToast(null);
-    setLastQuery(DEFAULT_SCAN_DIR);
+    setScanDropdownOpen(false);
+
     try {
-      const response = await apiPost('/scan', { directory: DEFAULT_SCAN_DIR });
+      let response;
+      if (scanMode === 'fullsystem') {
+        setLastQuery('Full System');
+        response = await apiPost('/scan/full', {});
+      } else {
+        setLastQuery(DEFAULT_SCAN_DIR);
+        response = await apiPost('/scan', { directory: DEFAULT_SCAN_DIR });
+      }
       setScanResults(response.data);
       setRemovedPaths(new Set());
       setCleanedPaths(new Set());
       clearSelection();
-      setToast({ type: 'success', message: 'Scan loaded into treemap.' });
+      setToast({ type: 'success', message: 'Scan complete.' });
     } catch (error) {
       setToast({ type: 'error', message: friendlyError(error) });
     } finally {
@@ -231,20 +256,67 @@ function AppContent() {
   });
 
   return (
-    <div className="app-container dark-theme">
+    <div className="app-container">
       <header className="app-header">
         <div className="brand-lockup">
-          <span className="brand-mark" aria-hidden="true">PL</span>
+          <div className="brand-icon" aria-hidden="true">
+            <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+              <circle cx="14" cy="14" r="13" stroke="#2563eb" strokeWidth="2"/>
+              <path d="M14 7v7l4 4" stroke="#2563eb" strokeWidth="2" strokeLinecap="round"/>
+            </svg>
+          </div>
           <div>
             <h1>PrivacyLens</h1>
-            <p>Offline Privacy Audit Tool</p>
+            <p className="brand-tagline">Offline Privacy Audit</p>
           </div>
         </div>
         <div className="header-actions">
           <span className={`scan-pulse ${scanning ? 'is-active' : ''}`} aria-hidden="true" />
-          <button type="button" className="btn-primary btn-scan" onClick={handleScan} disabled={scanning}>
-            {scanning ? 'Scanning...' : 'Scan Test Directory'}
-          </button>
+          <div className="scan-split-btn" ref={splitBtnRef}>
+            <button
+              type="button"
+              className="btn-primary scan-main"
+              onClick={handleScan}
+              disabled={scanning}
+            >
+              {scanning
+                ? 'Scanning...'
+                : scanMode === 'fullsystem'
+                ? 'Scan Full System'
+                : 'Scan Directory'}
+            </button>
+            <div className="scan-dropdown-wrap">
+              <button
+                type="button"
+                className="btn-primary scan-chevron"
+                disabled={scanning}
+                onClick={() => setScanDropdownOpen((v) => !v)}
+                aria-label="Choose scan mode"
+              >
+                ▾
+              </button>
+              {scanDropdownOpen && (
+                <div className="scan-dropdown-menu">
+                  <button
+                    type="button"
+                    className={scanMode === 'directory' ? 'active' : ''}
+                    onClick={() => { setScanMode('directory'); setScanDropdownOpen(false); }}
+                  >
+                    <strong>Scan Directory</strong>
+                    <span>Scans Downloads, Documents, Desktop and browser profiles</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={scanMode === 'fullsystem' ? 'active' : ''}
+                    onClick={() => { setScanMode('fullsystem'); setScanDropdownOpen(false); }}
+                  >
+                    <strong>Full System Scan</strong>
+                    <span>Deep scan including hidden folders, SSH keys, credentials, config files</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </header>
 
@@ -287,6 +359,7 @@ function AppContent() {
             data={treeData}
             aggregateBy={aggregateBy}
             onRemediate={requestRemediation}
+            colorScheme={LIGHT_SEVERITY_COLORS}
           />
 
           <aside className="details-panel" aria-label="Selected file details">
@@ -319,7 +392,7 @@ function AppContent() {
                 <div className="selected-file-list">
                   {selectedFiles.slice(0, 20).map((file) => (
                     <article key={file.path} className="selected-file">
-                      <strong>{file.name || file.path.split(/[\\/]/).pop()}</strong>
+                      <strong>{file.name || file.path.split(/[\\\/]/).pop()}</strong>
                       <span>{file.path}</span>
                       <span>
                         {SEVERITY_LABELS[file.severity || 0]} severity - {formatBytes(file.value)}
